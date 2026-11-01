@@ -1,7 +1,7 @@
 # Quilr AI - Field Developer Technical Assessment
 
-**Candidate:** Tanvi Casamudrala  
-**Target Role:** AI Field Developer / Solutions Engineer  
+**Candidate:** Tanvica Samudrala  
+**Target Role:** AI Field Developer 
 **Company:** Quilr AI  
 
 ---
