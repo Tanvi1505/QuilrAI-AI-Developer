@@ -20,7 +20,7 @@ Implements a runnable MCP server using the official Python SDK (`mcp.server.mcps
 * **Error Mapping (`-32602`):** I wanted a clear distinction between protocol validation errors and business logic:
   * Malformed formats (e.g. `INVALID`, negative amounts, short reasons) fail Pydantic validation and are mapped directly to standard JSON-RPC `-32602 (INVALID_PARAMS)` error codes.
   * Valid inputs for customers not in the database return an application response (`status: NOT_FOUND`) so the agent can understand what happened instead of blowing up the connection.
-* **Idempotency & Guardrails:** Added an optional `idempotency_key` on refunds so repeated tool calls from an agent retrying don't accidentally double-charge customers.
+* **Idempotency & Atomic Concurrency Guardrails:** Added durable idempotency on refunds backed by an on-disk SQLite ledger (`WAL` mode). To prevent race conditions from simultaneous requests sharing an idempotency key, the ledger uses `BEGIN IMMEDIATE` atomic reservation (`IN_PROGRESS` vs `SETTLED`). Exactly one concurrent request executes while others receive in-progress notices or settled replays without duplicate charges, surviving process restarts.
 
 ---
 
@@ -55,11 +55,11 @@ An LLM Gateway endpoint that streams Server-Sent Events (SSE) back to the client
 
 ### Why I built it this way
 * **The Boundary Token Problem:** Tokenizers don't emit words cleanly. An email like `alice@company.com` might arrive split across chunks as `["Contact ali", "ce@company.com"]`. If you just regex each chunk as it arrives, `Contact ali` slips through unredacted. If you wait until the stream finishes to check everything, you destroy Time To First Token (TTFT).
-* **Sliding Lookahead Window ($W = 64$ chars):** I implemented a bounded lookahead buffer:
-  * As chunks arrive, they append to a small internal buffer and regex redaction runs.
-  * Any text before the last 64 characters is guaranteed safe from upcoming splits and is yielded to the client immediately.
-  * When the stream finishes (`data: [DONE]`), whatever remains in the buffer is flushed.
-* **Memory & Performance:** Buffer memory never exceeds $W + \text{chunk\_size}$ (less than 150 bytes), meaning memory usage is constant $O(1)$ regardless of whether the output is 100 tokens or 100,000 tokens.
+* **Delimiter-Aware Lookahead Buffering:** I implemented a bounded lookahead buffer:
+  * Delimiter-aware emission: trailing active tokens (without whitespace/punctuation) are held in the buffer until a delimiter confirms the token is closed, completely preventing long emails or card numbers from being partially emitted prematurely.
+  * Supported formats: expanded regex handles standard RFC 5321 emails (up to 254 chars), US SSNs, and multiple payment card PAN formats (Visa 13/16, MasterCard, Amex 15-digit / 4-6-5, Diners Club 14-digit / 4-6-4, Discover).
+  * Lossless flush: when the stream terminates (or if upstream SSE drops without `[DONE]`), the `finally` block redacts and flushes any remaining buffer text so no tokens are lost.
+* **Memory & Performance:** Kept buffer bounds to $O(1)$ memory. To protect against malicious delimiter-free streams (e.g. continuous base64 payloads), tokens exceeding `max_unbroken_token_len` (512 chars) are progressively flushed, maintaining bounded memory without crashes.
 
 ---
 
@@ -77,6 +77,12 @@ A completion router that protects upstream LLMs and keeps the service available:
 3. If both providers fail, it returns a sanitized gateway error payload without exposing raw stack traces or internal host details.
 
 ### Why I built it this way
-* **On-Disk SQLite with WAL Mode:** Used `aiosqlite` with `PRAGMA journal_mode=WAL;`. WAL mode allows concurrent reads without blocking on writes, which is essential for a gateway handling multiple parallel requests.
-* **Atomic Eviction & Race Prevention:** A naive read-then-write check causes race conditions when multiple requests hit at the same time. The check, 60s cleanup, and insert are handled atomically under an async lock, and dynamic `Retry-After` seconds are calculated based on the oldest event in the active window.
-* **Clean Fallback & Sanitization:** The router sets an explicit 3.0s timeout on primary requests. On timeout, 429, or 5xx, it cleanly catches the issue and dispatches to backup. If everything fails, it returns an HTTP 502 with code `GATEWAY_UPSTREAM_UNAVAILABLE` and an assigned request ID, keeping internal IPs and tracebacks strictly hidden.
+* **Tenant Authentication & Parameter Validation:**
+  * Tenant identity is resolved from validated `Bearer` credentials rather than trusting spoofable headers, returning 401 for unauthorized calls.
+  * Quota protection: validates that `requested_tokens` and `max_tokens` are strictly positive integers (rejecting negative numbers, booleans, and floats with 400 Bad Request). Clamps client requests to a server-calculated prompt token floor to prevent rate-limit bypass.
+* **On-Disk SQLite with Cross-Process Concurrency:**
+  * Uses SQLite `PRAGMA journal_mode=WAL;` and `BEGIN IMMEDIATE` transaction write locks so separate worker processes/containers coordinate safely without races.
+  * The check, 60s cleanup, and allocation run atomically, returning dynamic `Retry-After` seconds based on the oldest record in the window.
+* **Strict Total Deadline & Sanitized Errors:**
+  * Wraps primary provider execution in `asyncio.wait_for` to guarantee a strict 3000ms absolute deadline across all network phases.
+  * If both providers fail, returns an HTTP 502 with `GATEWAY_UPSTREAM_UNAVAILABLE` and a correlation request ID, strictly stripping internal stack traces, IP addresses, and socket details.

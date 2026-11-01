@@ -197,3 +197,59 @@ async def test_streaming_proxy_end_to_end_pii_redaction_and_ttft():
             # Assert responsive TTFT (first token emitted well before full completion)
             assert ttft is not None
             assert len(received_tokens) > 1, "Expected multiple streamed chunks, not a single monolithic buffer"
+
+
+# ----------------------------------------------------------------------
+# 3. Adversarial Edge Case & Boundary Tests
+# ----------------------------------------------------------------------
+
+def test_adversarial_single_character_chunk_stream():
+    """Adversarially feeds input one character at a time to test boundary resilience."""
+    redactor = StreamingPIIRedactor(lookahead_window=20)
+    input_text = "Call alice at alice.smith@security.org or card 4111-2222-3333-4444 or 123-45-6789 today."
+
+    emitted = []
+    for ch in input_text:
+        out = redactor.process_chunk(ch)
+        if out:
+            emitted.append(out)
+    emitted.append(redactor.flush())
+
+    result = "".join(emitted)
+    assert "alice.smith@security.org" not in result
+    assert "4111-2222-3333-4444" not in result
+    assert "123-45-6789" not in result
+    assert "Call alice at [REDACTED] or card [REDACTED] or [REDACTED] today." == result
+
+
+def test_adversarial_diverse_credit_card_representations():
+    """Verify redaction across diverse credit card formats (Amex 4-6-5, Diners 4-6-4, continuous 15/16)."""
+    cards = [
+        ("Amex formatted", "Charge on 3782-822463-98710 card.", "Charge on [REDACTED] card."),
+        ("Amex spaced", "Charge on 3782 822463 98710 card.", "Charge on [REDACTED] card."),
+        ("Diners Club", "Charge on 3852-000000-0000 card.", "Charge on [REDACTED] card."),
+        ("MasterCard 16", "Charge on 5500222233334444 card.", "Charge on [REDACTED] card."),
+    ]
+    for desc, raw, expected in cards:
+        r = StreamingPIIRedactor(lookahead_window=20)
+        res = r.process_chunk(raw) + r.flush()
+        assert res == expected, f"Failed for {desc}: got {res}"
+
+
+def test_adversarial_unusually_long_unbroken_token():
+    """Verify that an unbroken token of 600 characters maintains bounded memory without crashing."""
+    redactor = StreamingPIIRedactor(lookahead_window=64, max_unbroken_token_len=256)
+    long_unbroken = "A" * 600
+
+    emitted = []
+    for i in range(0, len(long_unbroken), 50):
+        out = redactor.process_chunk(long_unbroken[i:i + 50])
+        if out:
+            emitted.append(out)
+    emitted.append(redactor.flush())
+
+    result = "".join(emitted)
+    assert len(result) == 600
+    assert result == long_unbroken
+    assert len(redactor.buffer) == 0  # Fully flushed
+

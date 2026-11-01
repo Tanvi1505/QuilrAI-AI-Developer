@@ -24,6 +24,7 @@ class SQLiteTokenRateLimiter:
         self.max_tokens_per_minute = max_tokens_per_minute
         self.window_seconds = window_seconds
         self._lock = asyncio.Lock()
+        self._initialized = False
 
     async def init_db(self):
         """Initialize database schema with WAL mode, busy timeout, and compound index."""
@@ -48,6 +49,7 @@ class SQLiteTokenRateLimiter:
                 """
             )
             await db.commit()
+        self._initialized = True
 
     async def check_and_record_tokens(
         self,
@@ -59,11 +61,23 @@ class SQLiteTokenRateLimiter:
 
         Uses SQLite BEGIN IMMEDIATE database-level write locks to guarantee
         cross-process safety across multiple worker processes / containers.
+        Rejects non-positive or malformed token amounts to prevent quota manipulation.
         """
+        if not isinstance(requested_tokens, int) or isinstance(requested_tokens, bool) or requested_tokens <= 0:
+            raise ValueError(
+                f"requested_tokens must be a strictly positive integer, received: {requested_tokens!r}"
+            )
+
+        if not tenant_id or not isinstance(tenant_id, str):
+            raise ValueError(f"tenant_id must be a non-empty string, received: {tenant_id!r}")
+
         if now is None:
             now = time.time()
 
         cutoff_time = now - self.window_seconds
+
+        if not self._initialized:
+            await self.init_db()
 
         # In-process mutex for coroutine coordination + SQLite BEGIN IMMEDIATE for cross-process coordination
         async with self._lock:
@@ -111,6 +125,23 @@ class SQLiteTokenRateLimiter:
                 except Exception:
                     await db.rollback()
                     raise
+
+    async def get_current_usage(self, tenant_id: str, now: Optional[float] = None) -> int:
+        """Query total active token usage recorded for a tenant within the sliding window."""
+        if now is None:
+            now = time.time()
+        cutoff_time = now - self.window_seconds
+
+        if not self._initialized:
+            await self.init_db()
+
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT COALESCE(SUM(tokens), 0) FROM token_usage_events WHERE tenant_id = ? AND timestamp >= ?;",
+                (tenant_id, cutoff_time),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return int(row[0]) if row else 0
 
     async def clear_all(self):
         """Purge all rate limit records (used in test fixtures)."""

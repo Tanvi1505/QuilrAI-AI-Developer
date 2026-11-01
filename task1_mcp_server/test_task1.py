@@ -251,3 +251,47 @@ def test_trigger_refund_idempotency_persists_across_server_restart():
     assert record2["status"] == "IDEMPOTENT_REPLAY"
     assert record2["data"]["refund_id"] == first_refund_id
     harness2.teardown()
+
+
+def test_trigger_refund_atomic_idempotency_concurrency():
+    """Verify that concurrent requests sharing an idempotency key cannot double-process."""
+    import asyncio
+    import concurrent.futures
+    from task1_mcp_server.server import trigger_refund
+
+    idem_key = f"idemp-race-{uuid.uuid4().hex[:8]}"
+
+    def call_refund():
+        return asyncio.run(
+            trigger_refund(
+                customer_id="CUST-10001",
+                amount=50.0,
+                reason="Concurrent race test validation",
+                idempotency_key=idem_key,
+            )
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(call_refund) for _ in range(5)]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    # Exactly one request must be PROCESSED; others must be either CONCURRENT_REQUEST_IN_PROGRESS or IDEMPOTENT_REPLAY
+    processed_results = [r for r in results if r.get("status") == "PROCESSED"]
+    replay_or_in_progress = [
+        r for r in results if r.get("status") in ("IDEMPOTENT_REPLAY", "CONCURRENT_REQUEST_IN_PROGRESS")
+    ]
+
+    assert len(processed_results) == 1
+    assert len(replay_or_in_progress) == 4
+
+    # Subsequent call after threads finish must be IDEMPOTENT_REPLAY
+    final_call = asyncio.run(
+        trigger_refund(
+            customer_id="CUST-10001",
+            amount=50.0,
+            reason="Concurrent race test validation",
+            idempotency_key=idem_key,
+        )
+    )
+    assert final_call["status"] == "IDEMPOTENT_REPLAY"
+    assert final_call["data"]["refund_id"] == processed_results[0]["refund_id"]

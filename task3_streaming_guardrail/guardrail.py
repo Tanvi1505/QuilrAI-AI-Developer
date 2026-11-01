@@ -23,9 +23,19 @@ SSN_REGEX = re.compile(
     r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b"
 )
 
-# 3. Credit Card Numbers (Visa, MasterCard, Amex, Discover, etc.)
+# 3. Credit Card Numbers (Visa 13/16-digit, MasterCard, Amex 15-digit / 4-6-5, Discover, Diners Club 14-digit / 4-6-4)
 CREDIT_CARD_REGEX = re.compile(
-    r"\b(?:\d{4}[-\s]?){3}\d{4}\b|\b3[47]\d{2}[-\s]?\d{6}[-\s]?\d{5}\b"
+    r"\b(?:"
+    r"4[0-9]{12}(?:[0-9]{3})?|"  # Visa 13 or 16 digit
+    r"(?:5[1-5][0-9]{2}|222[1-9]|22[3-9][0-9]|2[3-6][0-9]{2}|27[01][0-9]|2720)[0-9]{12}|"  # MasterCard
+    r"3[47][0-9]{13}|"  # Amex 15 digit continuous
+    r"3[47][0-9]{2}[-\s][0-9]{6}[-\s][0-9]{5}|"  # Amex 4-6-5 format
+    r"3(?:0[0-5]|[68][0-9])[0-9]{11}|"  # Diners Club 14 digit continuous
+    r"3(?:0[0-5]|[68][0-9])[0-9][-\s][0-9]{6}[-\s][0-9]{4}|"  # Diners Club 4-6-4 format
+    r"6(?:011|5[0-9]{2})[0-9]{12}|"  # Discover 16 digit
+    r"(?:[0-9]{4}[-\s]){3}[0-9]{4}|"  # Grouped 16 digit (4-4-4-4)
+    r"[0-9]{15,16}"  # Generic 15-16 continuous digits
+    r")\b"
 )
 
 PII_PATTERNS: List[Tuple[str, Pattern[str]]] = [
@@ -35,14 +45,27 @@ PII_PATTERNS: List[Tuple[str, Pattern[str]]] = [
 ]
 
 REDACTION_TOKEN = "[REDACTED]"
-RFC_5321_MAX_EMAIL_LEN = 256  # RFC 5321 ceiling on email address length
+DEFAULT_MAX_UNBROKEN_TOKEN_LEN = 512  # Upper ceiling to bound buffer memory against malicious delimiter-free streams
 
 
 class StreamingPIIRedactor:
-    """Bounded lookahead buffer with delimiter-aware emission for real-time PII redaction."""
+    """Bounded lookahead buffer with delimiter-aware emission for real-time PII redaction.
 
-    def __init__(self, lookahead_window: int = 64):
+    Operational Design & Documented Boundary Guarantees:
+    - Standard PII Protection: Fully redacts standard RFC 5321 emails (up to 254 chars),
+      US SSNs (9-11 chars), and major credit card PANs across arbitrary streaming chunk boundaries.
+    - Delimiter-Aware Windowing: Trailing active words (without trailing whitespace or punctuation)
+      are preserved in the lookahead buffer until closed, preventing partial token emission.
+    - Lossless Terminal Flush: Redacts and flushes remaining buffer on stream termination or disconnect.
+    - Memory Boundedness vs. Token Length Trade-off: To maintain O(1) bounded memory and prevent DOS
+      vulnerabilities from infinite streams without whitespace (e.g. continuous base64), tokens
+      exceeding `max_unbroken_token_len` (default 512 chars) are progressively flushed. If a non-standard
+      sensitive entity exceeds 512 continuous characters without a delimiter, partial emission can occur.
+    """
+
+    def __init__(self, lookahead_window: int = 64, max_unbroken_token_len: int = DEFAULT_MAX_UNBROKEN_TOKEN_LEN):
         self.lookahead_window = lookahead_window
+        self.max_unbroken_token_len = max_unbroken_token_len
         self.buffer = ""
         self.total_bytes_processed = 0
 
@@ -54,14 +77,7 @@ class StreamingPIIRedactor:
         return result
 
     def process_chunk(self, chunk: str) -> str:
-        """Ingest a stream chunk delta and return safe-to-emit redacted text.
-
-        Enforces:
-        1. Safe Redaction: Redacts closed tokens (preceding trailing whitespace/delimiter).
-        2. Boundary Guarantee: Never emits the middle of an un-delimited word token
-           (protecting emails or tokens of arbitrary length from premature emission).
-        3. Low TTFT: Safely emits closed words once buffer exceeds lookahead_window.
-        """
+        """Ingest a stream chunk delta and return safe-to-emit redacted text."""
         if not chunk:
             return ""
 
@@ -76,11 +92,11 @@ class StreamingPIIRedactor:
         )
 
         if last_space == -1:
-            # Unbroken word exceeds RFC 5321 email ceiling; safe to redact & emit leading slice
-            if len(self.buffer) > RFC_5321_MAX_EMAIL_LEN:
+            # Unbroken token exceeds max allowed buffer limit; apply redaction and emit leading slice to bound memory
+            if len(self.buffer) > self.max_unbroken_token_len:
                 self.buffer = self._redact_text(self.buffer)
-                safe_text = self.buffer[:-RFC_5321_MAX_EMAIL_LEN]
-                self.buffer = self.buffer[-RFC_5321_MAX_EMAIL_LEN:]
+                safe_text = self.buffer[:-self.lookahead_window]
+                self.buffer = self.buffer[-self.lookahead_window:]
                 return safe_text
             return ""
 

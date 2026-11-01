@@ -12,7 +12,7 @@ import logging
 import sys
 import uuid
 from datetime import datetime, timezone
-from typing import Annotated, Any, Dict, Optional
+from typing import Annotated, Any, Dict, Optional, Tuple
 
 from pydantic import Field, ValidationError
 
@@ -95,18 +95,119 @@ IDEMPOTENCY_DB_PATH = os.path.join(
 
 def _init_idempotency_store(db_path: str = IDEMPOTENCY_DB_PATH):
     """Ensure persistent on-disk idempotency table exists with WAL journaling."""
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=10.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS refund_idempotency (
                 idempotency_key TEXT PRIMARY KEY,
-                transaction_payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'SETTLED',
+                transaction_payload TEXT,
                 created_at TEXT NOT NULL
             );
             """
         )
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(refund_idempotency);")
+        columns = [col[1] for col in cur.fetchall()]
+        if "status" not in columns:
+            cur.execute("ALTER TABLE refund_idempotency ADD COLUMN status TEXT NOT NULL DEFAULT 'SETTLED';")
         conn.commit()
+
+
+def reserve_or_get_idempotency(
+    key: str, db_path: str = IDEMPOTENCY_DB_PATH
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """Atomically reserve or check an idempotency key in SQLite using BEGIN IMMEDIATE.
+
+    Guarantees cross-process and multi-thread mutual exclusion:
+    - ('SETTLED', payload): Previous request has completed. Safe to replay.
+    - ('IN_PROGRESS', None): A concurrent worker is currently processing this key.
+    - ('RESERVED', None): This caller won the reservation lock and must proceed.
+    """
+    _init_idempotency_store(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT status, transaction_payload FROM refund_idempotency WHERE idempotency_key = ?;",
+            (key,),
+        )
+        row = cur.fetchone()
+        if row:
+            status, payload_str = row
+            conn.execute("COMMIT;")
+            if status == "SETTLED" and payload_str:
+                return "SETTLED", json.loads(payload_str)
+            else:
+                return "IN_PROGRESS", None
+        else:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cur.execute(
+                """
+                INSERT INTO refund_idempotency (idempotency_key, status, transaction_payload, created_at)
+                VALUES (?, 'IN_PROGRESS', '', ?);
+                """,
+                (key, now_iso),
+            )
+            conn.execute("COMMIT;")
+            return "RESERVED", None
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+    finally:
+        conn.close()
+
+
+def finalize_idempotent_transaction(
+    key: str, record: Dict[str, Any], db_path: str = IDEMPOTENCY_DB_PATH
+):
+    """Mark an in-progress idempotency reservation as SETTLED with the final payload."""
+    _init_idempotency_store(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE refund_idempotency
+            SET status = 'SETTLED', transaction_payload = ?, created_at = ?
+            WHERE idempotency_key = ?;
+            """,
+            (
+                json.dumps(record),
+                record.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                key,
+            ),
+        )
+        conn.execute("COMMIT;")
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+    finally:
+        conn.close()
+
+
+def release_idempotency_reservation(
+    key: str, db_path: str = IDEMPOTENCY_DB_PATH
+):
+    """Release an in-progress reservation if execution fails before settling."""
+    _init_idempotency_store(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM refund_idempotency WHERE idempotency_key = ? AND status = 'IN_PROGRESS';",
+            (key,),
+        )
+        conn.execute("COMMIT;")
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+    finally:
+        conn.close()
 
 
 def get_idempotent_transaction(
@@ -114,16 +215,19 @@ def get_idempotent_transaction(
 ) -> Optional[Dict[str, Any]]:
     """Retrieve settled transaction record across process restarts."""
     _init_idempotency_store(db_path)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path, timeout=10.0)
+    try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT transaction_payload FROM refund_idempotency WHERE idempotency_key = ?;",
+            "SELECT transaction_payload FROM refund_idempotency WHERE idempotency_key = ? AND status = 'SETTLED';",
             (key,),
         )
         row = cur.fetchone()
-        if row:
+        if row and row[0]:
             return json.loads(row[0])
-    return None
+        return None
+    finally:
+        conn.close()
 
 
 def save_idempotent_transaction(
@@ -131,16 +235,31 @@ def save_idempotent_transaction(
 ):
     """Persist transaction record to disk for durability across deployments."""
     _init_idempotency_store(db_path)
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
+    conn = sqlite3.connect(db_path, timeout=10.0, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+        cur = conn.cursor()
+        cur.execute(
             """
-            INSERT OR REPLACE INTO refund_idempotency
-            (idempotency_key, transaction_payload, created_at)
-            VALUES (?, ?, ?);
+            INSERT INTO refund_idempotency (idempotency_key, status, transaction_payload, created_at)
+            VALUES (?, 'SETTLED', ?, ?)
+            ON CONFLICT(idempotency_key) DO UPDATE SET
+                status = 'SETTLED',
+                transaction_payload = excluded.transaction_payload,
+                created_at = excluded.created_at;
             """,
-            (key, json.dumps(record), record.get("timestamp", datetime.now(timezone.utc).isoformat())),
+            (
+                key,
+                json.dumps(record),
+                record.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            ),
         )
-        conn.commit()
+        conn.execute("COMMIT;")
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+    finally:
+        conn.close()
 
 
 # -----------------------------------------------------------------------------
@@ -291,69 +410,87 @@ async def trigger_refund(
         idempotency_key=idempotency_key,
     )
 
-    # 1. Durable Idempotency Check (Persistent across process restarts)
+    # 1. Durable Idempotency Check & Atomic Reservation
+    reserved_key = False
     if command.idempotency_key:
-        prior_transaction = get_idempotent_transaction(command.idempotency_key)
-        if prior_transaction:
+        state, prior_transaction = reserve_or_get_idempotency(command.idempotency_key)
+        if state == "SETTLED" and prior_transaction:
             logger.info(
                 "Idempotency hit for key '%s'. Returning existing transaction %s",
                 command.idempotency_key,
-                prior_transaction["refund_id"],
+                prior_transaction.get("refund_id"),
             )
             return {
                 "status": "IDEMPOTENT_REPLAY",
                 "message": "Transaction previously completed. Replaying confirmed transaction.",
                 "data": prior_transaction,
             }
+        elif state == "IN_PROGRESS":
+            logger.warning(
+                "Concurrent refund in progress for idempotency key '%s'",
+                command.idempotency_key,
+            )
+            return {
+                "status": "CONCURRENT_REQUEST_IN_PROGRESS",
+                "message": "A concurrent request with this idempotency key is actively processing.",
+            }
+        reserved_key = True
 
-    # 2. Customer Existence Check
-    canonical_id = command.customer_id
-    customer = ENTERPRISE_CUSTOMERS.get(canonical_id)
-    if not customer:
-        return {
-            "status": "FAILED",
-            "error_code": "CUSTOMER_NOT_FOUND",
-            "message": f"Cannot issue refund: Customer '{canonical_id}' does not exist.",
-        }
+    try:
+        # 2. Customer Existence Check
+        canonical_id = command.customer_id
+        customer = ENTERPRISE_CUSTOMERS.get(canonical_id)
+        if not customer:
+            if reserved_key and command.idempotency_key:
+                release_idempotency_reservation(command.idempotency_key)
+            return {
+                "status": "FAILED",
+                "error_code": "CUSTOMER_NOT_FOUND",
+                "message": f"Cannot issue refund: Customer '{canonical_id}' does not exist.",
+            }
 
-    # 3. Financial Transaction Processing
-    refund_id = f"REF-{uuid.uuid4().hex[:8].upper()}"
-    timestamp = datetime.now(timezone.utc).isoformat()
+        # 3. Financial Transaction Processing
+        refund_id = f"REF-{uuid.uuid4().hex[:8].upper()}"
+        timestamp = datetime.now(timezone.utc).isoformat()
 
-    transaction_record = {
-        "status": "PROCESSED",
-        "refund_id": refund_id,
-        "customer_id": canonical_id,
-        "amount": round(command.amount, 2),
-        "reason": command.reason,
-        "timestamp": timestamp,
-        "settled_currency": "USD",
-        "account_manager": customer["account_manager"],
-    }
-
-    # Save to durable on-disk idempotency ledger
-    if command.idempotency_key:
-        save_idempotent_transaction(command.idempotency_key, transaction_record)
-
-    # 4. Security Audit Log
-    emit_security_audit_event(
-        "REFUND_EXECUTED",
-        {
+        transaction_record = {
+            "status": "PROCESSED",
             "refund_id": refund_id,
             "customer_id": canonical_id,
-            "amount": command.amount,
+            "amount": round(command.amount, 2),
             "reason": command.reason,
-        },
-    )
+            "timestamp": timestamp,
+            "settled_currency": "USD",
+            "account_manager": customer["account_manager"],
+        }
 
-    logger.info(
-        "Refund %s executed: $%.2f credited to %s",
-        refund_id,
-        command.amount,
-        canonical_id,
-    )
+        # Finalize atomic reservation into SETTLED state with transaction payload
+        if reserved_key and command.idempotency_key:
+            finalize_idempotent_transaction(command.idempotency_key, transaction_record)
 
-    return transaction_record
+        # 4. Security Audit Log
+        emit_security_audit_event(
+            "REFUND_EXECUTED",
+            {
+                "refund_id": refund_id,
+                "customer_id": canonical_id,
+                "amount": command.amount,
+                "reason": command.reason,
+            },
+        )
+
+        logger.info(
+            "Refund %s executed: $%.2f credited to %s",
+            refund_id,
+            command.amount,
+            canonical_id,
+        )
+
+        return transaction_record
+    except Exception:
+        if reserved_key and command.idempotency_key:
+            release_idempotency_reservation(command.idempotency_key)
+        raise
 
 
 # -----------------------------------------------------------------------------

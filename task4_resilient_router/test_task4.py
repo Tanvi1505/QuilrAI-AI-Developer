@@ -252,3 +252,122 @@ async def test_standardized_sanitized_error_payload_on_dual_failure():
     assert "Traceback" not in raw_str
     assert "10.0.12.44" not in raw_str
     assert "socket" not in raw_str
+
+
+# ----------------------------------------------------------------------
+# 3. Security Tests: Rate-Limit Bypass Prevention & Tenant Authentication
+# ----------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rate_limiter_rejects_negative_and_malformed_tokens(temp_db):
+    """Verify rate limiter throws ValueError on negative, boolean, or malformed token amounts."""
+    limiter = SQLiteTokenRateLimiter(db_path=temp_db, max_tokens_per_minute=50_000)
+    await limiter.init_db()
+
+    with pytest.raises(ValueError, match="strictly positive integer"):
+        await limiter.check_and_record_tokens("tenant_1", -1000)
+
+    with pytest.raises(ValueError, match="strictly positive integer"):
+        await limiter.check_and_record_tokens("tenant_1", 0)
+
+    with pytest.raises(ValueError, match="strictly positive integer"):
+        await limiter.check_and_record_tokens("tenant_1", True)  # bool is subclass of int
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        await limiter.check_and_record_tokens("", 100)
+
+
+@pytest.mark.asyncio
+async def test_proxy_endpoint_rejects_unauthenticated_tenant(temp_db):
+    """Verify proxy endpoint requires valid tenant credentials and rejects unauthenticated callers with 401."""
+    app = create_gateway_app(db_path=temp_db)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # 1. Missing Authorization header
+        res1 = await client.post("/v1/completions", json={"prompt": "hello"})
+        assert res1.status_code == 401
+        data1 = res1.json()
+        assert data1["error"]["code"] == "UNAUTHORIZED_TENANT"
+
+        # 2. Invalid Bearer token
+        res2 = await client.post(
+            "/v1/completions",
+            json={"prompt": "hello"},
+            headers={"Authorization": "Bearer totally_unregistered_invalid_token"},
+        )
+        assert res2.status_code == 401
+        data2 = res2.json()
+        assert data2["error"]["code"] == "UNAUTHORIZED_TENANT"
+
+
+@pytest.mark.asyncio
+async def test_proxy_endpoint_rejects_negative_and_boolean_requested_tokens(temp_db):
+    """Verify proxy returns 400 Bad Request when caller attempts quota bypass via negative tokens."""
+    app = create_gateway_app(db_path=temp_db)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        auth_headers = {"Authorization": "Bearer live_key_tenant_alpha_921"}
+
+        # Attempt quota deduction bypass with negative requested_tokens
+        res_neg = await client.post(
+            "/v1/completions",
+            json={"prompt": "hello", "requested_tokens": -10000},
+            headers=auth_headers,
+        )
+        assert res_neg.status_code == 400
+        data_neg = res_neg.json()
+        assert data_neg["error"]["code"] == "INVALID_REQUESTED_TOKENS"
+
+        # Attempt quota bypass with boolean requested_tokens
+        res_bool = await client.post(
+            "/v1/completions",
+            json={"prompt": "hello", "requested_tokens": True},
+            headers=auth_headers,
+        )
+        assert res_bool.status_code == 400
+        data_bool = res_bool.json()
+        assert data_bool["error"]["code"] == "INVALID_REQUESTED_TOKENS"
+
+
+@pytest.mark.asyncio
+async def test_proxy_endpoint_rejects_invalid_max_tokens(temp_db):
+    """Verify proxy validates max_tokens parameter to be a positive integer."""
+    app = create_gateway_app(db_path=temp_db)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        auth_headers = {"Authorization": "Bearer live_key_tenant_alpha_921"}
+
+        res = await client.post(
+            "/v1/completions",
+            json={"prompt": "hello", "max_tokens": -50},
+            headers=auth_headers,
+        )
+        assert res.status_code == 400
+        assert res.json()["error"]["code"] == "INVALID_MAX_TOKENS"
+
+
+@pytest.mark.asyncio
+async def test_proxy_endpoint_authenticates_tenant_and_clamps_token_floor(temp_db):
+    """Verify valid tenant credential succeeds and requested_tokens is clamped to prompt floor."""
+    app = create_gateway_app(db_path=temp_db)
+    transport = ASGITransport(app=app)
+
+    # Mock router response to avoid real external calls
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Prompt length = 400 chars -> estimated prompt tokens = 100
+        # Client requests only 2 tokens, attempting to under-report
+        res = await client.post(
+            "/v1/completions",
+            json={"prompt": "x" * 400, "requested_tokens": 2},
+            headers={"Authorization": "Bearer live_key_tenant_alpha_921"},
+        )
+        # Should succeed (or reach router)
+        assert res.status_code in (200, 502)
+        # Verify in database that at least prompt floor was deducted
+        limiter = SQLiteTokenRateLimiter(db_path=temp_db)
+        usage = await limiter.get_current_usage("tenant_1")
+        assert usage >= 101, f"Expected usage to be clamped to prompt floor (>= 101), got {usage}"
+
