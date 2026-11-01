@@ -53,8 +53,11 @@ def emit_security_audit_event(event_type: str, details: Dict[str, Any]):
 
 
 # -----------------------------------------------------------------------------
-# Enterprise Mock Data Store & State
+# Enterprise Mock Data Store & Persistent Idempotency Ledger
 # -----------------------------------------------------------------------------
+import os
+import sqlite3
+
 ENTERPRISE_CUSTOMERS: Dict[str, Dict[str, Any]] = {
     "CUST-10001": {
         "customer_id": "CUST-10001",
@@ -85,8 +88,59 @@ ENTERPRISE_CUSTOMERS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# Transaction history for idempotency defense against agent retry loops
-PROCESSED_REFUND_TRANSACTIONS: Dict[str, Dict[str, Any]] = {}
+IDEMPOTENCY_DB_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "mcp_idempotency.db"
+)
+
+
+def _init_idempotency_store(db_path: str = IDEMPOTENCY_DB_PATH):
+    """Ensure persistent on-disk idempotency table exists with WAL journaling."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refund_idempotency (
+                idempotency_key TEXT PRIMARY KEY,
+                transaction_payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.commit()
+
+
+def get_idempotent_transaction(
+    key: str, db_path: str = IDEMPOTENCY_DB_PATH
+) -> Optional[Dict[str, Any]]:
+    """Retrieve settled transaction record across process restarts."""
+    _init_idempotency_store(db_path)
+    with sqlite3.connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT transaction_payload FROM refund_idempotency WHERE idempotency_key = ?;",
+            (key,),
+        )
+        row = cur.fetchone()
+        if row:
+            return json.loads(row[0])
+    return None
+
+
+def save_idempotent_transaction(
+    key: str, record: Dict[str, Any], db_path: str = IDEMPOTENCY_DB_PATH
+):
+    """Persist transaction record to disk for durability across deployments."""
+    _init_idempotency_store(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO refund_idempotency
+            (idempotency_key, transaction_payload, created_at)
+            VALUES (?, ?, ?);
+            """,
+            (key, json.dumps(record), record.get("timestamp", datetime.now(timezone.utc).isoformat())),
+        )
+        conn.commit()
 
 
 # -----------------------------------------------------------------------------
@@ -237,19 +291,20 @@ async def trigger_refund(
         idempotency_key=idempotency_key,
     )
 
-    # 1. Idempotency Check: Guard against agent hallucination retry loops
-    if command.idempotency_key and command.idempotency_key in PROCESSED_REFUND_TRANSACTIONS:
-        prior_transaction = PROCESSED_REFUND_TRANSACTIONS[command.idempotency_key]
-        logger.info(
-            "Idempotency hit for key '%s'. Returning existing transaction %s",
-            command.idempotency_key,
-            prior_transaction["refund_id"],
-        )
-        return {
-            "status": "IDEMPOTENT_REPLAY",
-            "message": "Transaction previously completed. Replaying confirmed transaction.",
-            "data": prior_transaction,
-        }
+    # 1. Durable Idempotency Check (Persistent across process restarts)
+    if command.idempotency_key:
+        prior_transaction = get_idempotent_transaction(command.idempotency_key)
+        if prior_transaction:
+            logger.info(
+                "Idempotency hit for key '%s'. Returning existing transaction %s",
+                command.idempotency_key,
+                prior_transaction["refund_id"],
+            )
+            return {
+                "status": "IDEMPOTENT_REPLAY",
+                "message": "Transaction previously completed. Replaying confirmed transaction.",
+                "data": prior_transaction,
+            }
 
     # 2. Customer Existence Check
     canonical_id = command.customer_id
@@ -276,9 +331,9 @@ async def trigger_refund(
         "account_manager": customer["account_manager"],
     }
 
-    # Save to idempotency ledger
+    # Save to durable on-disk idempotency ledger
     if command.idempotency_key:
-        PROCESSED_REFUND_TRANSACTIONS[command.idempotency_key] = transaction_record
+        save_idempotent_transaction(command.idempotency_key, transaction_record)
 
     # 4. Security Audit Log
     emit_security_audit_event(

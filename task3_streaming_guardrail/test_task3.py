@@ -75,6 +75,41 @@ def test_cross_chunk_boundary_credit_card_redaction():
     assert "Payment processed on card: [REDACTED] successfully." == full_result
 
 
+def test_cross_chunk_boundary_very_long_email_redaction():
+    """Verify that an email longer than 80 chars split across chunks is completely redacted."""
+    redactor = StreamingPIIRedactor(lookahead_window=256)
+    long_email = "very.long.enterprise.compliance.officer.name@security-governance.corp.subdomain.internal-systems.com"
+    chunks = [
+        "Please forward the audit dossier to ",
+        "very.long.enterprise.",
+        "compliance.officer.name@",
+        "security-governance.corp.",
+        "subdomain.internal-systems.com",
+        " for review.",
+    ]
+    emitted = []
+    for c in chunks:
+        out = redactor.process_chunk(c)
+        if out:
+            emitted.append(out)
+    emitted.append(redactor.flush())
+
+    full_result = "".join(emitted)
+    assert long_email not in full_result
+    assert "Please forward the audit dossier to [REDACTED] for review." == full_result
+
+
+def test_lossless_flush_when_upstream_drops_without_done():
+    """Verify that any trailing buffer is flushed and not lost if upstream connection drops without [DONE]."""
+    redactor = StreamingPIIRedactor(lookahead_window=256)
+    # Stream text that is shorter than lookahead_window (held in buffer)
+    redactor.process_chunk("Final concluding message from model")
+    # Simulate abrupt connection termination
+    flushed = redactor.flush()
+    assert flushed == "Final concluding message from model"
+    assert len(redactor.buffer) == 0
+
+
 def test_memory_efficiency_bounded_buffer():
     """Verify that processing 10,000 tokens maintains an O(1) bounded buffer size."""
     lookahead = 50

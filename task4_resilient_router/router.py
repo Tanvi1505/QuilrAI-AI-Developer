@@ -43,14 +43,16 @@ class ResilientModelRouter:
         should_failover = False
         failover_reason = ""
 
-        # --- Attempt Primary Model Provider ---
+        # --- Attempt Primary Model Provider with Strict Wall-Clock Deadline ---
         try:
             logger.info("[%s] Routing to primary provider: %s", req_id, self.primary_url)
-            resp = await self.http_client.post(
+            # Enforce strict wall-clock deadline across all network phases (DNS, connect, TLS, transfer)
+            primary_coro = self.http_client.post(
                 self.primary_url,
                 json=payload,
-                timeout=self.primary_timeout,
+                timeout=httpx.Timeout(self.primary_timeout, connect=1.0),
             )
+            resp = await asyncio.wait_for(primary_coro, timeout=self.primary_timeout)
 
             # Check for 429 status requirement
             if resp.status_code == 429:
@@ -64,7 +66,7 @@ class ResilientModelRouter:
             else:
                 return resp.status_code, resp.json()
 
-        except httpx.TimeoutException:
+        except (httpx.TimeoutException, asyncio.TimeoutError):
             should_failover = True
             failover_reason = f"Primary provider timed out after {int(self.primary_timeout * 1000)}ms"
             logger.warning("[%s] TIMEOUT: %s", req_id, failover_reason)

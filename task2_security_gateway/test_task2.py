@@ -25,10 +25,12 @@ def test_setup():
     gateway_app = create_gateway_app(downstream_url="http://mock-downstream/mcp")
     # Patch forward function for direct in-memory fast testing
     from task2_security_gateway import gateway
+    original_forward = gateway.forward_to_downstream
     gateway.forward_to_downstream = mock_forward_to_downstream
 
     gateway_transport = ASGITransport(app=gateway_app)
-    return gateway_transport
+    yield gateway_transport
+    gateway.forward_to_downstream = original_forward
 
 
 @pytest.mark.asyncio
@@ -187,3 +189,26 @@ async def test_preshared_token_support(test_setup):
         )
         assert "result" in res_admin.json()
         assert len(call_history) == 1
+
+
+@pytest.mark.asyncio
+async def test_downstream_connection_failure_sanitization():
+    """Verify that downstream network failures return sanitized HTTP 502 without leaking internal socket/IP info."""
+    # Point gateway to a non-existent port to simulate downstream outage
+    broken_gateway = create_gateway_app(downstream_url="http://127.0.0.1:59999/mcp")
+    transport = ASGITransport(app=broken_gateway)
+    admin_token = create_token(role="admin")
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 505, "method": "tools/list"},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert res.status_code == 502
+        body = res.json()
+        assert body["error"]["code"] == -32002
+        assert "temporarily unavailable" in body["error"]["message"]
+        # Ensure internal port or socket trace is NOT leaked in message
+        assert "59999" not in body["error"]["message"]
+        assert "ConnectionRefused" not in body["error"]["message"]

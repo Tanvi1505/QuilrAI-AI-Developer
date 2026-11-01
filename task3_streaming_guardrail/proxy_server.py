@@ -24,60 +24,66 @@ def create_proxy_app(upstream_url: str = "http://127.0.0.1:8002/v1/chat/completi
         upstream_response: httpx.Response,
         lookahead_window: int = 64,
     ) -> AsyncGenerator[str, None]:
-        """Stream guardrailed chunks to client while redacting PII in real time."""
+        """Stream guardrailed chunks to client while redacting PII in real time.
+
+        Guarantees lossless buffer flush even if upstream terminates without [DONE].
+        """
         redactor = StreamingPIIRedactor(lookahead_window=lookahead_window)
         chunk_index = 0
 
-        async for line in upstream_response.aiter_lines():
-            line_str = line.strip()
-            if not line_str:
-                continue
-
-            if line_str == "data: [DONE]":
-                # Stream finished upstream; flush remaining buffer
-                final_tail = redactor.flush()
-                if final_tail:
-                    chunk_index += 1
-                    flush_chunk = {
-                        "id": f"gw-chunk-{chunk_index}",
-                        "object": "chat.completion.chunk",
-                        "choices": [
-                            {"index": 0, "delta": {"content": final_tail}, "finish_reason": None}
-                        ],
-                    }
-                    yield f"data: {json.dumps(flush_chunk)}\n\n"
-
-                yield "data: [DONE]\n\n"
-                break
-
-            if line_str.startswith("data: "):
-                raw_json = line_str[6:]
-                try:
-                    payload = json.loads(raw_json)
-                except json.JSONDecodeError:
+        try:
+            async for line in upstream_response.aiter_lines():
+                line_str = line.strip()
+                if not line_str:
                     continue
 
-                delta_content = ""
-                choices = payload.get("choices", [])
-                if choices and "delta" in choices[0]:
-                    delta_content = choices[0]["delta"].get("content", "")
+                if line_str == "data: [DONE]":
+                    break
 
-                if delta_content:
-                    safe_text = redactor.process_chunk(delta_content)
-                    if safe_text:
-                        chunk_index += 1
-                        out_chunk = {
-                            "id": f"gw-chunk-{chunk_index}",
-                            "object": "chat.completion.chunk",
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": safe_text},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(out_chunk)}\n\n"
+                if line_str.startswith("data: "):
+                    raw_json = line_str[6:]
+                    try:
+                        payload = json.loads(raw_json)
+                    except json.JSONDecodeError:
+                        continue
+
+                    delta_content = ""
+                    choices = payload.get("choices", [])
+                    if choices and "delta" in choices[0]:
+                        delta_content = choices[0]["delta"].get("content", "")
+
+                    if delta_content:
+                        safe_text = redactor.process_chunk(delta_content)
+                        if safe_text:
+                            chunk_index += 1
+                            out_chunk = {
+                                "id": f"gw-chunk-{chunk_index}",
+                                "object": "chat.completion.chunk",
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": safe_text},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(out_chunk)}\n\n"
+
+        finally:
+            # Lossless drain: Guarantee remaining buffer is flushed and redacted even if connection broke
+            final_tail = redactor.flush()
+            if final_tail:
+                chunk_index += 1
+                flush_chunk = {
+                    "id": f"gw-chunk-{chunk_index}",
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {"index": 0, "delta": {"content": final_tail}, "finish_reason": None}
+                    ],
+                }
+                yield f"data: {json.dumps(flush_chunk)}\n\n"
+
+            yield "data: [DONE]\n\n"
 
     @app.post("/v1/chat/completions")
     async def chat_completions_proxy(request: Request):

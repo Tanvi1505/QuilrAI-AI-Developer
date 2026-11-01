@@ -176,14 +176,16 @@ async def forward_to_downstream(
             media_type="application/json",
         )
     except httpx.RequestError as exc:
-        logger.error("Downstream MCP server unreachable: %s", exc)
+        # Log internal network diagnostics exclusively to stderr for operators
+        logger.error("Downstream MCP server unreachable at %s: %s", downstream_url, exc)
         req_id = payload.get("id")
+        # Sanitize error envelope: zero internal socket / IP topology leakage to callers
         return JSONResponse(
             status_code=502,
             content=make_jsonrpc_error(
                 req_id,
                 -32002,
-                f"Gateway error: Unable to reach downstream MCP server: {str(exc)}",
+                "Gateway error: Downstream MCP service is temporarily unavailable",
             ),
         )
 

@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 import pytest
 
 PYTHON_BIN = sys.executable
@@ -198,7 +199,7 @@ def test_trigger_refund_validation_failures_code_32602(
 
 def test_trigger_refund_idempotency_guard(mcp_harness: MCPStdioTestHarness):
     """Verify that repeated calls with the same idempotency key replay safely without double-charging."""
-    idem_key = "idemp-test-agent-9901"
+    idem_key = f"idemp-test-agent-{uuid.uuid4().hex[:8]}"
     args = {
         "customer_id": "CUST-10001",
         "amount": 75.00,
@@ -217,3 +218,36 @@ def test_trigger_refund_idempotency_guard(mcp_harness: MCPStdioTestHarness):
     record2 = json.loads(res2["result"]["content"][0]["text"])
     assert record2["status"] == "IDEMPOTENT_REPLAY"
     assert record2["data"]["refund_id"] == first_refund_id
+
+
+def test_trigger_refund_idempotency_persists_across_server_restart():
+    """Verify that idempotency survives complete server restart (durable on-disk SQLite ledger)."""
+    idem_key = f"idemp-restart-key-{uuid.uuid4().hex[:8]}"
+    args = {
+        "customer_id": "CUST-10001",
+        "amount": 120.00,
+        "reason": "Annual maintenance refund adjustment",
+        "idempotency_key": idem_key,
+    }
+
+    # 1. Start Server Instance 1
+    harness1 = MCPStdioTestHarness()
+    harness1.send_rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "c1", "version": "1"}})
+    harness1.send_notify("notifications/initialized")
+    res1 = harness1.send_rpc("tools/call", {"name": "trigger_refund", "arguments": args})
+    record1 = json.loads(res1["result"]["content"][0]["text"])
+    assert record1["status"] == "PROCESSED"
+    first_refund_id = record1["refund_id"]
+    harness1.teardown()
+
+    # 2. Simulate complete server reboot / new container deployment
+    harness2 = MCPStdioTestHarness()
+    harness2.send_rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "c2", "version": "1"}})
+    harness2.send_notify("notifications/initialized")
+    res2 = harness2.send_rpc("tools/call", {"name": "trigger_refund", "arguments": args})
+    record2 = json.loads(res2["result"]["content"][0]["text"])
+
+    # Must replay settled transaction from SQLite disk ledger without generating a new refund
+    assert record2["status"] == "IDEMPOTENT_REPLAY"
+    assert record2["data"]["refund_id"] == first_refund_id
+    harness2.teardown()

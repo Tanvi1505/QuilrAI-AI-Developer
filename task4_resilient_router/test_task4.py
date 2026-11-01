@@ -109,6 +109,33 @@ async def test_concurrent_token_allocation_race_condition(temp_db):
     assert results.count(False) == 4
 
 
+@pytest.mark.asyncio
+async def test_cross_process_sqlite_locking_simulation(temp_db):
+    """Verify that multiple independent rate-limiter instances (simulating separate OS worker processes)
+
+    coordinate atomically via SQLite BEGIN IMMEDIATE database-level file locks.
+    """
+    # Create 3 distinct limiter instances simulating 3 different server workers
+    limiter_proc1 = SQLiteTokenRateLimiter(db_path=temp_db, max_tokens_per_minute=20_000)
+    limiter_proc2 = SQLiteTokenRateLimiter(db_path=temp_db, max_tokens_per_minute=20_000)
+    limiter_proc3 = SQLiteTokenRateLimiter(db_path=temp_db, max_tokens_per_minute=20_000)
+    await limiter_proc1.init_db()
+
+    limiters = [limiter_proc1, limiter_proc2, limiter_proc3]
+
+    # Concurrently fire 10 requests of 3,000 tokens distributed across the 3 independent limiter instances
+    async def worker_request(i: int):
+        target_limiter = limiters[i % 3]
+        allowed, _, _ = await target_limiter.check_and_record_tokens("multi_worker_tenant", 3_000)
+        return allowed
+
+    results = await asyncio.gather(*[worker_request(i) for i in range(10)])
+    allowed_count = sum(1 for r in results if r is True)
+    # Total limit 20,000 / 3,000 = exactly 6 allowed (6 * 3000 = 18,000; 7th = 21,000)
+    assert allowed_count == 6
+    assert results.count(False) == 4
+
+
 # ----------------------------------------------------------------------
 # 2. Tests for Resilient Model Routing & Fallback Mechanics
 # ----------------------------------------------------------------------
