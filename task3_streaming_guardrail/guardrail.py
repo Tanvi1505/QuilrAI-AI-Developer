@@ -64,7 +64,8 @@ class StreamingPIIRedactor:
     """
 
     def __init__(self, lookahead_window: int = 64, max_unbroken_token_len: int = DEFAULT_MAX_UNBROKEN_TOKEN_LEN):
-        self.lookahead_window = lookahead_window
+        # Enforce minimum 32-char lookahead to guarantee spaced SSNs (11 chars) and Cards (19 chars) are never partially emitted
+        self.lookahead_window = max(lookahead_window, 32)
         self.max_unbroken_token_len = max_unbroken_token_len
         self.buffer = ""
         self.total_bytes_processed = 0
@@ -77,14 +78,30 @@ class StreamingPIIRedactor:
         return result
 
     def process_chunk(self, chunk: str) -> str:
-        """Ingest a stream chunk delta and return safe-to-emit redacted text."""
+        """Ingest a stream chunk delta and return safe-to-emit redacted text.
+
+        Enforces:
+        1. Unified Spaced PII Redaction: Evaluates SSN and Credit Card patterns across the active buffer,
+           supporting valid internal whitespace and hyphens (e.g. '123 45 6789', '4111 2222 3333 4444')
+           without breaking across space boundaries.
+        2. Delimiter-Aware Email Redaction: Redacts emails strictly on closed tokens (before the active
+           trailing word) to prevent premature matching of intermediate subdomains (e.g. '.corp.' or '.or').
+        3. Oversized Token Protection: Replaces unbroken tokens exceeding max_unbroken_token_len with
+           [REDACTED] to guarantee zero sensitive data leakage while maintaining bounded O(1) memory.
+        4. Lookahead Tail Protection: Holds at least lookahead_window (>= 32 chars) so incomplete
+           spaced entities are never partially emitted.
+        """
         if not chunk:
             return ""
 
         self.total_bytes_processed += len(chunk)
         self.buffer += chunk
 
-        # Locate the boundary of the trailing active token
+        # 1. Redact digit-based PII across buffer (supports internal spaces and hyphens)
+        self.buffer = SSN_REGEX.sub(REDACTION_TOKEN, self.buffer)
+        self.buffer = CREDIT_CARD_REGEX.sub(REDACTION_TOKEN, self.buffer)
+
+        # 2. Check whitespace boundary for email redaction and token emission
         last_space = max(
             self.buffer.rfind(" "),
             self.buffer.rfind("\n"),
@@ -92,38 +109,42 @@ class StreamingPIIRedactor:
         )
 
         if last_space == -1:
-            # Unbroken token exceeds max allowed buffer limit; apply redaction and emit leading slice to bound memory
-            if len(self.buffer) > self.max_unbroken_token_len:
-                self.buffer = self._redact_text(self.buffer)
-                safe_text = self.buffer[:-self.lookahead_window]
-                self.buffer = self.buffer[-self.lookahead_window:]
-                return safe_text
+            if len(self.buffer) >= self.max_unbroken_token_len:
+                # Oversized uninterrupted token: to prevent leaking sensitive substrings
+                # while preserving bounded O(1) memory, replace oversized token with REDACTION_TOKEN
+                self.buffer = ""
+                return REDACTION_TOKEN
             return ""
 
-        # Redact all closed tokens before the trailing active token
+        # 3. Redact emails strictly on closed tokens preceding the active trailing word
         closed_part = self.buffer[:last_space]
         trailing_part = self.buffer[last_space:]
-        self.buffer = self._redact_text(closed_part) + trailing_part
+        self.buffer = EMAIL_REGEX.sub(REDACTION_TOKEN, closed_part) + trailing_part
 
-        # Recalculate delimiter boundary after redaction substitutions
+        # Recalculate delimiter boundary after email redaction substitution
         last_space = max(
             self.buffer.rfind(" "),
             self.buffer.rfind("\n"),
             self.buffer.rfind("\t"),
         )
 
-        # Emit safe portion: must be older than lookahead_window AND strictly before active trailing word
-        if len(self.buffer) > self.lookahead_window:
-            safe_cutoff = min(len(self.buffer) - self.lookahead_window, last_space + 1)
-            last_delim = max(
-                self.buffer.rfind(" ", 0, safe_cutoff),
-                self.buffer.rfind("\n", 0, safe_cutoff),
-            )
-            emit_idx = (last_delim + 1) if last_delim != -1 else safe_cutoff
-            if emit_idx > 0:
-                safe_text = self.buffer[:emit_idx]
-                self.buffer = self.buffer[emit_idx:]
-                return safe_text
+        # 4. Calculate safe emission index
+        safe_cutoff = min(len(self.buffer) - self.lookahead_window, last_space + 1)
+        if safe_cutoff <= 0:
+            return ""
+
+        # Find the last word boundary before safe_cutoff to emit cleanly on word delimiters
+        last_delim = max(
+            self.buffer.rfind(" ", 0, safe_cutoff),
+            self.buffer.rfind("\n", 0, safe_cutoff),
+            self.buffer.rfind("\t", 0, safe_cutoff),
+        )
+        emit_idx = (last_delim + 1) if last_delim != -1 else safe_cutoff
+
+        if emit_idx > 0:
+            safe_text = self.buffer[:emit_idx]
+            self.buffer = self.buffer[emit_idx:]
+            return safe_text
 
         return ""
 

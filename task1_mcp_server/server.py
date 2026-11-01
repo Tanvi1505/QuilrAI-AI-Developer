@@ -115,6 +115,9 @@ def _init_idempotency_store(db_path: str = IDEMPOTENCY_DB_PATH):
         conn.commit()
 
 
+IDEMPOTENCY_RESERVATION_TTL_SECONDS = 60.0  # Time-to-live for in-progress locks before reclaiming stale reservations
+
+
 def reserve_or_get_idempotency(
     key: str, db_path: str = IDEMPOTENCY_DB_PATH
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
@@ -122,8 +125,14 @@ def reserve_or_get_idempotency(
 
     Guarantees cross-process and multi-thread mutual exclusion:
     - ('SETTLED', payload): Previous request has completed. Safe to replay.
-    - ('IN_PROGRESS', None): A concurrent worker is currently processing this key.
-    - ('RESERVED', None): This caller won the reservation lock and must proceed.
+    - ('IN_PROGRESS', None): A concurrent worker is currently processing this key within TTL.
+    - ('RESERVED', None): This caller won the reservation lock (or reclaimed a stale lock) and must proceed.
+
+    Reservation Recovery Architecture:
+    If a server worker crashes or network breaks mid-transaction, an idempotency key could be left
+    permanently stuck as IN_PROGRESS. We enforce a 60s TTL on IN_PROGRESS reservations. If a subsequent
+    request arrives after the TTL has expired without settling, the reservation is safely reclaimed,
+    allowing recovery from worker failures without risking simultaneous duplicate executions.
     """
     _init_idempotency_store(db_path)
     conn = sqlite3.connect(db_path, timeout=10.0, isolation_level=None)
@@ -131,16 +140,47 @@ def reserve_or_get_idempotency(
         conn.execute("BEGIN IMMEDIATE;")
         cur = conn.cursor()
         cur.execute(
-            "SELECT status, transaction_payload FROM refund_idempotency WHERE idempotency_key = ?;",
+            "SELECT status, transaction_payload, created_at FROM refund_idempotency WHERE idempotency_key = ?;",
             (key,),
         )
         row = cur.fetchone()
         if row:
-            status, payload_str = row
-            conn.execute("COMMIT;")
+            status, payload_str, created_at_iso = row
             if status == "SETTLED" and payload_str:
+                conn.execute("COMMIT;")
                 return "SETTLED", json.loads(payload_str)
+
+            # Check if reservation is stale due to an interrupted/crashed process
+            is_stale = False
+            age_seconds = 0.0
+            try:
+                created_dt = datetime.fromisoformat(created_at_iso)
+                age_seconds = (datetime.now(timezone.utc) - created_dt).total_seconds()
+                if age_seconds > IDEMPOTENCY_RESERVATION_TTL_SECONDS:
+                    is_stale = True
+            except Exception:
+                pass
+
+            if is_stale:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                cur.execute(
+                    """
+                    UPDATE refund_idempotency
+                    SET status = 'IN_PROGRESS', created_at = ?, transaction_payload = ''
+                    WHERE idempotency_key = ?;
+                    """,
+                    (now_iso, key),
+                )
+                conn.execute("COMMIT;")
+                logger.warning(
+                    "Reclaimed stale IN_PROGRESS reservation for key '%s' (age: %.1fs > TTL: %.1fs)",
+                    key,
+                    age_seconds,
+                    IDEMPOTENCY_RESERVATION_TTL_SECONDS,
+                )
+                return "RESERVED", None
             else:
+                conn.execute("COMMIT;")
                 return "IN_PROGRESS", None
         else:
             now_iso = datetime.now(timezone.utc).isoformat()

@@ -1,7 +1,7 @@
 """Task 4: Complete LLM Gateway Server integrating Rate Limiter & Fallback Router."""
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Dict, Optional
 from fastapi import FastAPI, Header, Request, status
 from fastapi.responses import JSONResponse
 import httpx
@@ -18,9 +18,13 @@ TENANT_CREDENTIALS_REGISTRY = {
 }
 
 
-def authenticate_tenant(authorization: Optional[str]) -> Optional[str]:
+def authenticate_tenant(
+    authorization: Optional[str],
+    credentials_registry: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
     """Authenticate incoming caller credentials and securely resolve tenant identity.
 
+    Strictly matches tokens against the verified credentials registry.
     Rejects unauthenticated callers to prevent tenant spoofing or quota exhaustion attacks.
     """
     if not authorization or not authorization.startswith("Bearer "):
@@ -28,12 +32,8 @@ def authenticate_tenant(authorization: Optional[str]) -> Optional[str]:
     token = authorization.split("Bearer ", 1)[1].strip()
     if not token:
         return None
-    if token in TENANT_CREDENTIALS_REGISTRY:
-        return TENANT_CREDENTIALS_REGISTRY[token]
-    # Allow structured tenant keys for test harness execution
-    if token.startswith("tenant_") or token.startswith("key_"):
-        return token
-    return None
+    registry = credentials_registry if credentials_registry is not None else TENANT_CREDENTIALS_REGISTRY
+    return registry.get(token)
 
 
 def create_gateway_app(
@@ -42,6 +42,7 @@ def create_gateway_app(
     primary_url: str = "http://127.0.0.1:8003/v1/completions",
     secondary_url: str = "http://127.0.0.1:8004/v1/completions",
     http_client: Optional[httpx.AsyncClient] = None,
+    tenant_credentials: Optional[Dict[str, str]] = None,
 ) -> FastAPI:
     rate_limiter = SQLiteTokenRateLimiter(
         db_path=db_path,
@@ -75,7 +76,7 @@ def create_gateway_app(
         req_id = f"req-{uuid.uuid4().hex[:12]}"
 
         # 1. Tenant Authentication & Identification (reject unauthenticated access)
-        tenant_id = authenticate_tenant(authorization)
+        tenant_id = authenticate_tenant(authorization, credentials_registry=tenant_credentials)
         if not tenant_id:
             return JSONResponse(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -104,7 +105,7 @@ def create_gateway_app(
                 },
             )
 
-        # 2. Server-Side Token Estimation & Strict Client Parameter Validation
+        # 2. Server-Side Token Estimation & Quota Reservation
         prompt_text = payload.get("prompt", "")
         max_tokens = payload.get("max_tokens", 256)
         if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
@@ -121,7 +122,8 @@ def create_gateway_app(
             )
 
         estimated_prompt_tokens = max(1, len(prompt_text) // 4)
-        min_required_tokens = estimated_prompt_tokens + 1
+        # Quota reservation MUST account for estimated prompt input AND permitted maximum output
+        min_reservation_tokens = estimated_prompt_tokens + max_tokens
 
         if "requested_tokens" in payload:
             req_tok = payload["requested_tokens"]
@@ -138,10 +140,10 @@ def create_gateway_app(
                         }
                     },
                 )
-            # Guard against quota bypass: clamp to server-calculated minimum prompt floor
-            total_requested_tokens = max(req_tok, min_required_tokens)
+            # Guard against quota bypass: clamp reservation to account for permitted maximum output
+            total_requested_tokens = max(req_tok, min_reservation_tokens)
         else:
-            total_requested_tokens = estimated_prompt_tokens + max_tokens
+            total_requested_tokens = min_reservation_tokens
 
         # 3. Sliding Window Rate Limiter Check (backed by SQLite)
         allowed, current_used, retry_after = await rate_limiter.check_and_record_tokens(

@@ -20,7 +20,7 @@ Implements a runnable MCP server using the official Python SDK (`mcp.server.mcps
 * **Error Mapping (`-32602`):** I wanted a clear distinction between protocol validation errors and business logic:
   * Malformed formats (e.g. `INVALID`, negative amounts, short reasons) fail Pydantic validation and are mapped directly to standard JSON-RPC `-32602 (INVALID_PARAMS)` error codes.
   * Valid inputs for customers not in the database return an application response (`status: NOT_FOUND`) so the agent can understand what happened instead of blowing up the connection.
-* **Idempotency & Atomic Concurrency Guardrails:** Added durable idempotency on refunds backed by an on-disk SQLite ledger (`WAL` mode). To prevent race conditions from simultaneous requests sharing an idempotency key, the ledger uses `BEGIN IMMEDIATE` atomic reservation (`IN_PROGRESS` vs `SETTLED`). Exactly one concurrent request executes while others receive in-progress notices or settled replays without duplicate charges, surviving process restarts.
+* **Idempotency, Atomic Concurrency & Crash Recovery:** Added durable idempotency on refunds backed by an on-disk SQLite ledger (`WAL` mode). To prevent race conditions from simultaneous requests sharing an idempotency key, the ledger uses `BEGIN IMMEDIATE` atomic reservation (`IN_PROGRESS` vs `SETTLED`). Exactly one concurrent request executes while others receive in-progress notices or settled replays without duplicate charges. If a worker process is interrupted or crashes mid-flight, a 60-second reservation TTL automatically reclaims stale locks so retries are never permanently blocked.
 
 ---
 
@@ -55,11 +55,12 @@ An LLM Gateway endpoint that streams Server-Sent Events (SSE) back to the client
 
 ### Why I built it this way
 * **The Boundary Token Problem:** Tokenizers don't emit words cleanly. An email like `alice@company.com` might arrive split across chunks as `["Contact ali", "ce@company.com"]`. If you just regex each chunk as it arrives, `Contact ali` slips through unredacted. If you wait until the stream finishes to check everything, you destroy Time To First Token (TTFT).
-* **Delimiter-Aware Lookahead Buffering:** I implemented a bounded lookahead buffer:
-  * Delimiter-aware emission: trailing active tokens (without whitespace/punctuation) are held in the buffer until a delimiter confirms the token is closed, completely preventing long emails or card numbers from being partially emitted prematurely.
+* **Delimiter-Aware Lookahead Buffering & Spaced Patterns:**
+  * Spaced PII handling: SSNs and credit card numbers contain valid internal spaces or hyphens (e.g. `123 45 6789`, `4111 2222 3333 4444`). These are evaluated across the active buffer rather than being split by whitespace, and held by a minimum 32-character lookahead window so incomplete spaced patterns are never prematurely emitted.
+  * Delimiter-aware email emission: trailing active tokens without whitespace/punctuation are held in the buffer until a delimiter confirms the token is closed, completely preventing emails or subdomains from being partially matched or sliced.
   * Supported formats: expanded regex handles standard RFC 5321 emails (up to 254 chars), US SSNs, and multiple payment card PAN formats (Visa 13/16, MasterCard, Amex 15-digit / 4-6-5, Diners Club 14-digit / 4-6-4, Discover).
   * Lossless flush: when the stream terminates (or if upstream SSE drops without `[DONE]`), the `finally` block redacts and flushes any remaining buffer text so no tokens are lost.
-* **Memory & Performance:** Kept buffer bounds to $O(1)$ memory. To protect against malicious delimiter-free streams (e.g. continuous base64 payloads), tokens exceeding `max_unbroken_token_len` (512 chars) are progressively flushed, maintaining bounded memory without crashes.
+* **Oversized Token Defense & Bounded Memory:** To maintain $O(1)$ memory and protect against delimiter-free streams (e.g. continuous base64 payloads), unbroken tokens exceeding `max_unbroken_token_len` (512 chars) are replaced with `[REDACTED]` rather than emitted as raw slices, guaranteeing zero sensitive text leakage.
 
 ---
 
@@ -77,9 +78,10 @@ A completion router that protects upstream LLMs and keeps the service available:
 3. If both providers fail, it returns a sanitized gateway error payload without exposing raw stack traces or internal host details.
 
 ### Why I built it this way
-* **Tenant Authentication & Parameter Validation:**
-  * Tenant identity is resolved from validated `Bearer` credentials rather than trusting spoofable headers, returning 401 for unauthorized calls.
-  * Quota protection: validates that `requested_tokens` and `max_tokens` are strictly positive integers (rejecting negative numbers, booleans, and floats with 400 Bad Request). Clamps client requests to a server-calculated prompt token floor to prevent rate-limit bypass.
+* **Strict Tenant Authentication & Quota Reservation:**
+  * Tenant identity is resolved strictly from verified `Bearer` credentials against a registered credentials store (with dependency injection for test environments), returning 401 for unauthorized calls with no wildcard bypasses.
+  * Quota protection: validates that `requested_tokens` and `max_tokens` are strictly positive integers (rejecting negative numbers, booleans, and floats with 400 Bad Request).
+  * Output reservation: server-side quota reservations enforce prompt tokens plus permitted maximum output (`estimated_prompt_tokens + max_tokens`), preventing clients from bypassing rate limits by supplying tiny token estimates.
 * **On-Disk SQLite with Cross-Process Concurrency:**
   * Uses SQLite `PRAGMA journal_mode=WAL;` and `BEGIN IMMEDIATE` transaction write locks so separate worker processes/containers coordinate safely without races.
   * The check, 60s cleanup, and allocation run atomically, returning dynamic `Retry-After` seconds based on the oldest record in the window.

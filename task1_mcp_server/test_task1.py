@@ -6,6 +6,7 @@ Tests verify:
 3. Edge Case Handling: Pydantic format validation, bounds, and idempotency replay.
 4. Security Telemetry: stderr receives structured audit events without leaking to stdout.
 """
+import asyncio
 import json
 import os
 import subprocess
@@ -295,3 +296,49 @@ def test_trigger_refund_atomic_idempotency_concurrency():
     )
     assert final_call["status"] == "IDEMPOTENT_REPLAY"
     assert final_call["data"]["refund_id"] == processed_results[0]["refund_id"]
+
+
+def test_stale_idempotency_reservation_recovery():
+    """Verify that an abandoned IN_PROGRESS reservation from a crashed worker is recovered after TTL."""
+    import sqlite3
+    from datetime import datetime, timezone, timedelta
+    from task1_mcp_server.server import trigger_refund, IDEMPOTENCY_DB_PATH, _init_idempotency_store
+
+    _init_idempotency_store(IDEMPOTENCY_DB_PATH)
+    stale_key = f"idemp-stale-{uuid.uuid4().hex[:8]}"
+    stale_time = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+
+    # Simulate an interrupted/crashed process leaving an un-settled IN_PROGRESS state
+    with sqlite3.connect(IDEMPOTENCY_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO refund_idempotency (idempotency_key, status, transaction_payload, created_at)
+            VALUES (?, 'IN_PROGRESS', '', ?);
+            """,
+            (stale_key, stale_time),
+        )
+        conn.commit()
+
+    # Subsequent retry arrives: must reclaim the stale lock and process rather than blocking permanently
+    res = asyncio.run(
+        trigger_refund(
+            customer_id="CUST-10001",
+            amount=80.0,
+            reason="Recovery retry after worker crash",
+            idempotency_key=stale_key,
+        )
+    )
+    assert res["status"] == "PROCESSED"
+    assert res["customer_id"] == "CUST-10001"
+
+    # Following call should replay settled transaction
+    replay = asyncio.run(
+        trigger_refund(
+            customer_id="CUST-10001",
+            amount=80.0,
+            reason="Recovery retry after worker crash",
+            idempotency_key=stale_key,
+        )
+    )
+    assert replay["status"] == "IDEMPOTENT_REPLAY"
+    assert replay["data"]["refund_id"] == res["refund_id"]

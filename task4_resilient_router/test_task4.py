@@ -300,6 +300,48 @@ async def test_proxy_endpoint_rejects_unauthenticated_tenant(temp_db):
         data2 = res2.json()
         assert data2["error"]["code"] == "UNAUTHORIZED_TENANT"
 
+        # 3. Arbitrary prefix token (tenant_xyz or key_abc) without registry registration must be rejected
+        res3 = await client.post(
+            "/v1/completions",
+            json={"prompt": "hello"},
+            headers={"Authorization": "Bearer tenant_arbitrary_unregistered"},
+        )
+        assert res3.status_code == 401
+        assert res3.json()["error"]["code"] == "UNAUTHORIZED_TENANT"
+
+        res4 = await client.post(
+            "/v1/completions",
+            json={"prompt": "hello"},
+            headers={"Authorization": "Bearer key_unregistered"},
+        )
+        assert res4.status_code == 401
+        assert res4.json()["error"]["code"] == "UNAUTHORIZED_TENANT"
+
+
+@pytest.mark.asyncio
+async def test_proxy_endpoint_dependency_injection_tenant_credentials(temp_db):
+    """Verify custom tenant credentials registry can be injected for isolated test environments."""
+    custom_registry = {"custom_test_secret_99": "injected_test_tenant"}
+    app = create_gateway_app(db_path=temp_db, tenant_credentials=custom_registry)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Injected credential succeeds
+        res = await client.post(
+            "/v1/completions",
+            json={"prompt": "test prompt", "max_tokens": 10},
+            headers={"Authorization": "Bearer custom_test_secret_99"},
+        )
+        assert res.status_code in (200, 502)
+
+        # Standard credential not in custom registry is rejected
+        res_other = await client.post(
+            "/v1/completions",
+            json={"prompt": "test prompt"},
+            headers={"Authorization": "Bearer live_key_tenant_alpha_921"},
+        )
+        assert res_other.status_code == 401
+
 
 @pytest.mark.asyncio
 async def test_proxy_endpoint_rejects_negative_and_boolean_requested_tokens(temp_db):
@@ -351,23 +393,25 @@ async def test_proxy_endpoint_rejects_invalid_max_tokens(temp_db):
 
 @pytest.mark.asyncio
 async def test_proxy_endpoint_authenticates_tenant_and_clamps_token_floor(temp_db):
-    """Verify valid tenant credential succeeds and requested_tokens is clamped to prompt floor."""
+    """Verify valid tenant credential succeeds and requested_tokens accounts for permitted maximum output."""
     app = create_gateway_app(db_path=temp_db)
     transport = ASGITransport(app=app)
 
     # Mock router response to avoid real external calls
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         # Prompt length = 400 chars -> estimated prompt tokens = 100
+        # max_tokens defaults to 256
+        # Expected reservation: prompt (100) + max_tokens (256) = 356
         # Client requests only 2 tokens, attempting to under-report
         res = await client.post(
             "/v1/completions",
-            json={"prompt": "x" * 400, "requested_tokens": 2},
+            json={"prompt": "x" * 400, "requested_tokens": 2, "max_tokens": 256},
             headers={"Authorization": "Bearer live_key_tenant_alpha_921"},
         )
         # Should succeed (or reach router)
         assert res.status_code in (200, 502)
-        # Verify in database that at least prompt floor was deducted
+        # Verify in database that reservation accounted for permitted maximum output
         limiter = SQLiteTokenRateLimiter(db_path=temp_db)
         usage = await limiter.get_current_usage("tenant_1")
-        assert usage >= 101, f"Expected usage to be clamped to prompt floor (>= 101), got {usage}"
+        assert usage >= 356, f"Expected usage to account for permitted maximum output (>= 356), got {usage}"
 

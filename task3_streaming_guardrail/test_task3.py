@@ -236,20 +236,54 @@ def test_adversarial_diverse_credit_card_representations():
         assert res == expected, f"Failed for {desc}: got {res}"
 
 
-def test_adversarial_unusually_long_unbroken_token():
-    """Verify that an unbroken token of 600 characters maintains bounded memory without crashing."""
-    redactor = StreamingPIIRedactor(lookahead_window=64, max_unbroken_token_len=256)
-    long_unbroken = "A" * 600
+def test_adversarial_unusually_long_unbroken_token_replaced():
+    """Verify that an uninterrupted token exceeding max length is replaced with [REDACTED] to prevent leaks."""
+    redactor = StreamingPIIRedactor(lookahead_window=32, max_unbroken_token_len=100)
+    oversized_token = "A" * 150
 
     emitted = []
-    for i in range(0, len(long_unbroken), 50):
-        out = redactor.process_chunk(long_unbroken[i:i + 50])
+    for i in range(0, len(oversized_token), 25):
+        out = redactor.process_chunk(oversized_token[i:i + 25])
         if out:
             emitted.append(out)
     emitted.append(redactor.flush())
 
     result = "".join(emitted)
-    assert len(result) == 600
-    assert result == long_unbroken
-    assert len(redactor.buffer) == 0  # Fully flushed
+    assert "[REDACTED]" in result
+    assert "A" * 100 not in result
+    assert len(redactor.buffer) == 0
+
+
+def test_cross_chunk_boundary_spaced_ssn_redaction():
+    """Verify SSNs split across whitespace chunk boundaries are completely redacted."""
+    redactor = StreamingPIIRedactor(lookahead_window=32)
+    chunks = ["Customer SSN is 123 ", "45 ", "6789 for account verification."]
+    emitted = []
+    for c in chunks:
+        out = redactor.process_chunk(c)
+        if out:
+            emitted.append(out)
+    emitted.append(redactor.flush())
+
+    full_result = "".join(emitted)
+    assert "123 45 6789" not in full_result
+    assert "123" not in full_result
+    assert "Customer SSN is [REDACTED] for account verification." == full_result
+
+
+def test_cross_chunk_boundary_spaced_credit_card_redaction():
+    """Verify credit card numbers split across whitespace chunk boundaries are completely redacted."""
+    redactor = StreamingPIIRedactor(lookahead_window=32)
+    chunks = ["Payment processed on card 4111 ", "2222 ", "3333 ", "4444 successfully."]
+    emitted = []
+    for c in chunks:
+        out = redactor.process_chunk(c)
+        if out:
+            emitted.append(out)
+    emitted.append(redactor.flush())
+
+    full_result = "".join(emitted)
+    assert "4111 2222 3333 4444" not in full_result
+    assert "4111" not in full_result
+    assert "Payment processed on card [REDACTED] successfully." == full_result
 
