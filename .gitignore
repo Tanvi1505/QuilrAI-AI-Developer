@@ -1,0 +1,26 @@
+# Python virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local SQLite databases & logs
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
