@@ -4,21 +4,6 @@
 **Target Role:** AI Field Developer 
 **Company:** Quilr AI  
 
----
-
-This repository contains my implementation for the 4 assessment tasks. Each task is self-contained in its own directory with implementation files and automated tests.
-
-To run all tests across all tasks:
-```bash
-./run_all_tests.sh
-```
-or simply:
-```bash
-pytest -v
-```
-
----
-
 ## [Task 1: Custom MCP Server with Strict Validation & Transport Handling](./task1_mcp_server)
 
 * **Code:** [`task1_mcp_server/server.py`](./task1_mcp_server/server.py)
