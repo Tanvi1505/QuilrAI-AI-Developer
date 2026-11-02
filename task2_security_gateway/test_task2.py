@@ -212,3 +212,41 @@ async def test_downstream_connection_failure_sanitization():
         # Ensure internal port or socket trace is NOT leaked in message
         assert "59999" not in body["error"]["message"]
         assert "ConnectionRefused" not in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_tools_call_malformed_params_returns_code_32602(test_setup):
+    """Verify that non-object params or non-string tool names return standard JSON-RPC -32602 error."""
+    transport = test_setup
+    admin_token = create_token(role="admin")
+    headers = {"Authorization": f"Bearer {admin_token}"}
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Case 1: params is integer instead of dict
+        res1 = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 101, "method": "tools/call", "params": 123},
+            headers=headers,
+        )
+        assert res1.status_code == 400
+        assert res1.json()["error"]["code"] == -32602
+        assert "must be a JSON object" in res1.json()["error"]["message"]
+
+        # Case 2: params['name'] is integer instead of string
+        res2 = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 102, "method": "tools/call", "params": {"name": 123}},
+            headers=headers,
+        )
+        assert res2.status_code == 400
+        assert res2.json()["error"]["code"] == -32602
+        assert "must be a non-empty string" in res2.json()["error"]["message"]
+
+        # Case 3: params['name'] is empty string
+        res3 = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 103, "method": "tools/call", "params": {"name": ""}},
+            headers=headers,
+        )
+        assert res3.status_code == 400
+        assert res3.json()["error"]["code"] == -32602

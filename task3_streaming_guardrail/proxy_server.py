@@ -1,10 +1,11 @@
 """Task 3: LLM Gateway Proxy Endpoint with Real-Time Streaming PII Redaction Guardrail."""
+import asyncio
 import json
 import logging
 import sys
 from typing import AsyncGenerator
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 
 from task3_streaming_guardrail.guardrail import StreamingPIIRedactor
@@ -68,31 +69,62 @@ def create_proxy_app(upstream_url: str = "http://127.0.0.1:8002/v1/chat/completi
                                 ],
                             }
                             yield f"data: {json.dumps(out_chunk)}\n\n"
+        except asyncio.CancelledError:
+            # Client disconnected / stream cancelled; cleanly propagate without yielding
+            raise
 
-        finally:
-            # Lossless drain: Guarantee remaining buffer is flushed and redacted even if connection broke
-            final_tail = redactor.flush()
-            if final_tail:
-                chunk_index += 1
-                flush_chunk = {
-                    "id": f"gw-chunk-{chunk_index}",
-                    "object": "chat.completion.chunk",
-                    "choices": [
-                        {"index": 0, "delta": {"content": final_tail}, "finish_reason": None}
-                    ],
-                }
-                yield f"data: {json.dumps(flush_chunk)}\n\n"
+        # Lossless drain on normal stream completion / EOF: Guarantee remaining buffer is flushed and redacted
+        final_tail = redactor.flush()
+        if final_tail:
+            chunk_index += 1
+            flush_chunk = {
+                "id": f"gw-chunk-{chunk_index}",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {"index": 0, "delta": {"content": final_tail}, "finish_reason": None}
+                ],
+            }
+            yield f"data: {json.dumps(flush_chunk)}\n\n"
 
-            yield "data: [DONE]\n\n"
+        yield "data: [DONE]\n\n"
 
     @app.post("/v1/chat/completions")
     async def chat_completions_proxy(request: Request):
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": "INVALID_JSON", "message": "Malformed JSON body"}},
+            )
+
         client = httpx.AsyncClient(timeout=30.0)
 
-        # Send request to upstream model provider
-        req = client.build_request("POST", upstream_url, json=body)
-        resp = await client.send(req, stream=True)
+        # Connect to upstream model provider with explicit lifecycle and failure handling
+        try:
+            req = client.build_request("POST", upstream_url, json=body)
+            resp = await client.send(req, stream=True)
+            if resp.status_code >= 400:
+                await resp.aread()
+                status_code = resp.status_code
+                error_body = resp.text
+                await resp.aclose()
+                await client.aclose()
+                return JSONResponse(
+                    status_code=status_code,
+                    content={"error": {"code": "UPSTREAM_ERROR", "message": error_body}},
+                )
+        except Exception:
+            await client.aclose()
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": {
+                        "code": "UPSTREAM_UNAVAILABLE",
+                        "message": "Failed to connect to upstream LLM service",
+                    }
+                },
+            )
 
         async def response_wrapper():
             try:

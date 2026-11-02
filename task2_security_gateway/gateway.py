@@ -133,8 +133,29 @@ def create_gateway_app(downstream_url: str = "http://127.0.0.1:8001/mcp") -> Fas
 
         # Case B: tools/call -> Inspect tool name for 'admin_' prefix
         if method == "tools/call":
-            params = payload.get("params", {})
-            tool_name = params.get("name", "")
+            params = payload.get("params")
+            if not isinstance(params, dict):
+                logger.warning("Rejected tools/call: 'params' is not a JSON object")
+                return JSONResponse(
+                    status_code=400,
+                    content=make_jsonrpc_error(
+                        req_id=req_id,
+                        code=-32602,
+                        message="Invalid params: 'params' must be a JSON object",
+                    ),
+                )
+
+            tool_name = params.get("name")
+            if not isinstance(tool_name, str) or not tool_name:
+                logger.warning("Rejected tools/call: 'name' is not a valid string")
+                return JSONResponse(
+                    status_code=400,
+                    content=make_jsonrpc_error(
+                        req_id=req_id,
+                        code=-32602,
+                        message="Invalid params: 'name' must be a non-empty string",
+                    ),
+                )
 
             if tool_name.startswith("admin_"):
                 if user_role != "admin":

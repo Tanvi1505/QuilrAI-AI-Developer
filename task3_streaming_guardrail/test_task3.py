@@ -300,3 +300,57 @@ def test_cross_chunk_boundary_spaced_credit_card_redaction():
     assert "4111" not in full_result
     assert "Payment processed on card [REDACTED] successfully." == full_result
 
+
+def test_adversarial_multichunk_oversized_token_with_sensitive_suffix():
+    """Verify that a 2,000-char unbroken token arriving across 50 small chunks with a sensitive suffix is statefully discarded."""
+    redactor = StreamingPIIRedactor(lookahead_window=32, max_unbroken_token_len=100)
+    raw_token = ("A" * 1960) + "sensitive_leak@corp.internal.com"
+    full_stream_text = "Log start: " + raw_token + " and subsequent safe text."
+
+    # Slice stream into 50 chunks of ~40 characters each
+    chunk_size = 40
+    chunks = [full_stream_text[i:i + chunk_size] for i in range(0, len(full_stream_text), chunk_size)]
+    assert len(chunks) >= 50
+
+    emitted = []
+    for c in chunks:
+        out = redactor.process_chunk(c)
+        if out:
+            emitted.append(out)
+    emitted.append(redactor.flush())
+
+    full_result = "".join(emitted)
+    assert "sensitive_leak@corp.internal.com" not in full_result
+    assert "A" * 100 not in full_result
+    assert "[REDACTED]" in full_result
+    assert "and subsequent safe text." in full_result
+    assert redactor.discarding_oversized_token is False
+
+
+@pytest.mark.asyncio
+async def test_streaming_proxy_upstream_unavailable_returns_502():
+    """Verify proxy returns structured 502 with clean JSON when upstream is unreachable."""
+    proxy_app = create_proxy_app(upstream_url="http://127.0.0.1:59999/v1/chat/completions")
+    proxy_transport = ASGITransport(app=proxy_app)
+    async with AsyncClient(transport=proxy_transport, base_url="http://test-gw") as client:
+        resp = await client.post("/v1/chat/completions", json={"prompt": "ping"})
+        assert resp.status_code == 502
+        data = resp.json()
+        assert data["error"]["code"] == "UPSTREAM_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_streaming_proxy_malformed_json_returns_400():
+    """Verify proxy returns structured 400 when request body is not valid JSON."""
+    proxy_app = create_proxy_app()
+    proxy_transport = ASGITransport(app=proxy_app)
+    async with AsyncClient(transport=proxy_transport, base_url="http://test-gw") as client:
+        resp = await client.post(
+            "/v1/chat/completions",
+            content=b"invalid-json-data",
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["error"]["code"] == "INVALID_JSON"
+

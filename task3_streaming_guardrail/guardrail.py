@@ -9,6 +9,7 @@ Production-grade Streaming PII Guardrail addressing enterprise requirements:
 3. Bounded O(1) Memory: Constant bounded footprint.
 4. Lossless Flush: Guaranteed flush of remaining buffer on EOF or connection drops.
 """
+import asyncio
 import re
 from typing import AsyncGenerator, List, Pattern, Tuple
 
@@ -69,6 +70,7 @@ class StreamingPIIRedactor:
         self.max_unbroken_token_len = max_unbroken_token_len
         self.buffer = ""
         self.total_bytes_processed = 0
+        self.discarding_oversized_token = False
 
     def _redact_text(self, text: str) -> str:
         """Apply all PII regex patterns to text."""
@@ -86,8 +88,9 @@ class StreamingPIIRedactor:
            without breaking across space boundaries.
         2. Delimiter-Aware Email Redaction: Redacts emails strictly on closed tokens (before the active
            trailing word) to prevent premature matching of intermediate subdomains (e.g. '.corp.' or '.or').
-        3. Oversized Token Protection: Replaces unbroken tokens exceeding max_unbroken_token_len with
-           [REDACTED] to guarantee zero sensitive data leakage while maintaining bounded O(1) memory.
+        3. Stateful Oversized Token Defense: Replaces unbroken tokens exceeding max_unbroken_token_len with
+           [REDACTED] and maintains a discarding state so subsequent chunks of the same oversized token
+           cannot be emitted as fragments before the next delimiter.
         4. Lookahead Tail Protection: Holds at least lookahead_window (>= 32 chars) so incomplete
            spaced entities are never partially emitted.
         """
@@ -95,6 +98,18 @@ class StreamingPIIRedactor:
             return ""
 
         self.total_bytes_processed += len(chunk)
+
+        # 0. If actively discarding a continuing oversized token, swallow incoming text until next delimiter
+        if self.discarding_oversized_token:
+            delims = [pos for pos in (chunk.find(" "), chunk.find("\n"), chunk.find("\t")) if pos != -1]
+            if not delims:
+                return ""
+            first_delim = min(delims)
+            self.discarding_oversized_token = False
+            chunk = chunk[first_delim:]
+            if not chunk:
+                return ""
+
         self.buffer += chunk
 
         # 1. Redact digit-based PII across buffer (supports internal spaces and hyphens)
@@ -111,6 +126,7 @@ class StreamingPIIRedactor:
 
         # Apply bounded memory defense to active trailing token, even if preceded by ordinary text
         if trailing_token_len >= self.max_unbroken_token_len:
+            self.discarding_oversized_token = True
             if last_space == -1:
                 # Buffer contains solely an oversized unbroken token
                 self.buffer = ""
@@ -118,8 +134,8 @@ class StreamingPIIRedactor:
             else:
                 # Buffer starts with ordinary text followed by an oversized unbroken token
                 prefix = self.buffer[: last_space + 1]
-                self.buffer = prefix + REDACTION_TOKEN + " "
-                last_space = len(self.buffer) - 1
+                self.buffer = ""
+                return self._redact_text(prefix) + REDACTION_TOKEN
 
         if last_space == -1:
             return ""
@@ -177,7 +193,9 @@ async def redact_stream(
             safe_output = redactor.process_chunk(chunk)
             if safe_output:
                 yield safe_output
-    finally:
-        final_output = redactor.flush()
-        if final_output:
-            yield final_output
+    except asyncio.CancelledError:
+        raise
+
+    final_output = redactor.flush()
+    if final_output:
+        yield final_output
