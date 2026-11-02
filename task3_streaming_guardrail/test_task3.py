@@ -389,3 +389,61 @@ async def test_streaming_proxy_upstream_error_sanitization():
             assert data["error"]["message"] == "Upstream model provider returned an error"
             assert "db-node-7.prod.internal.local" not in resp.text
 
+
+@pytest.mark.asyncio
+async def test_stream_interrupted_midway_safely_flushes_buffer_without_leakage():
+    """Verify that if upstream disconnects mid-stream, buffered PII is safely redacted and flushed without crash."""
+    from unittest.mock import MagicMock
+    from task3_streaming_guardrail.proxy_server import stream_guardrailed_response
+
+    mock_resp = MagicMock()
+    chunk1 = {"choices": [{"delta": {"content": "Initial report: User email is agent.smith@"}}]}
+    chunk2 = {"choices": [{"delta": {"content": "internal-corp.org and active."}}]}
+
+    async def mock_aiter_lines():
+        yield f"data: {json.dumps(chunk1)}\n\n"
+        yield f"data: {json.dumps(chunk2)}\n\n"
+        # Simulate abrupt network/transport drop mid-stream
+        raise httpx.RemoteProtocolError("Connection abruptly terminated by upstream model peer")
+
+    mock_resp.aiter_lines = mock_aiter_lines
+
+    received_tokens = []
+    # Consume generator directly
+    async for sse_chunk in stream_guardrailed_response(mock_resp, lookahead_window=32):
+        line = sse_chunk.strip()
+        if line.startswith("data: "):
+            payload = json.loads(line[6:])
+            content = payload["choices"][0]["delta"].get("content", "")
+            if content:
+                received_tokens.append(content)
+
+    full_received = "".join(received_tokens)
+    # 1. Verify stream does not leak raw PII
+    assert "agent.smith@internal-corp.org" not in full_received
+    # 2. Verify redaction occurred
+    assert "[REDACTED]" in full_received
+    assert "Initial report:" in full_received
+
+
+@pytest.mark.asyncio
+async def test_stream_client_cancellation_propagates_cleanly():
+    """Verify that if client cancels consumption, generator exits cleanly without raising RuntimeError."""
+    from unittest.mock import MagicMock
+    from task3_streaming_guardrail.proxy_server import stream_guardrailed_response
+
+    mock_resp = MagicMock()
+
+    async def mock_aiter_lines():
+        for i in range(10):
+            chunk = {"choices": [{"delta": {"content": f"token_{i} "}}]}
+            yield f"data: {json.dumps(chunk)}\n\n"
+
+    mock_resp.aiter_lines = mock_aiter_lines
+
+    gen = stream_guardrailed_response(mock_resp)
+    first_item = await anext(gen)
+    assert first_item
+    # Close generator early (simulating client disconnection / GeneratorExit)
+    await gen.aclose()
+

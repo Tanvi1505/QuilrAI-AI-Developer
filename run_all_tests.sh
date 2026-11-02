@@ -37,5 +37,5 @@ $PYTEST_EXEC task4_resilient_router/test_task4.py -v --tb=short
 
 echo ""
 echo "======================================================================"
-echo "✅ ALL 4 ASSESSMENT TASKS PASSED WITH FULL SPECIFICATION COMPLIANCE"
+echo "✅ All configured assessment tests passed."
 echo "======================================================================"

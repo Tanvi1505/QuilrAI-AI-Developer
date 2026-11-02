@@ -25,8 +25,12 @@ We designed and implemented a **Streaming Lookahead Buffer** (`StreamingPIIRedac
    - Complete pattern matches within `buffer` are immediately redacted to `[REDACTED]`.
    - If `len(buffer) > W`, the prefix `buffer[:-W]` is guaranteed to be free of cross-boundary splits and is **immediately yielded to the client**.
    - `buffer` retains only the trailing $W$ characters.
-3. **Stream Termination (EOF Flush)**:
+3. **Stream Termination and Mid-Stream Interruption Handling**:
    - When upstream emits `data: [DONE]`, the redactor performs a final pattern scan over the remaining buffer and flushes it before sending `[DONE]`.
+   - If the upstream connection drops or errors midway (e.g. `RemoteProtocolError`, socket close), the proxy catches the transport error, logs a sanitized warning without dumping raw bodies, flushes the accumulated lookahead buffer through the PII redactor (preventing PII from being leaked or lost), and terminates without emitting `[DONE]` to signify an interrupted stream.
+   - If the downstream client disconnects (`asyncio.CancelledError`), the generator cleanly terminates and releases upstream client resources without attempting invalid post-cancellation yields.
+4. **Log Sanitization & Information Disclosure Prevention**:
+   - When upstream services return HTTP error statuses, the proxy logs only the HTTP status code and endpoint metadata. Raw upstream error bodies are never written to server logs to prevent accidental exposure of confidential prompts, echoed PII, or internal stack traces.
 
 ## Mathematical & Performance Guarantees
 - **Strictly Bounded Memory ($O(1)$)**:

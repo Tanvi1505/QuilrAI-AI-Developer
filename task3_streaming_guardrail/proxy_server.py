@@ -18,79 +18,86 @@ logging.basicConfig(
 logger = logging.getLogger("llm_gateway_proxy")
 
 
-def create_proxy_app(upstream_url: str = "http://127.0.0.1:8002/v1/chat/completions") -> FastAPI:
-    app = FastAPI(title="LLMGatewayStreamingGuardrail")
+async def stream_guardrailed_response(
+    upstream_response: httpx.Response,
+    lookahead_window: int = 64,
+) -> AsyncGenerator[str, None]:
+    """Stream guardrailed chunks to client while redacting PII in real time.
 
-    async def stream_guardrailed_response(
-        upstream_response: httpx.Response,
-        lookahead_window: int = 64,
-    ) -> AsyncGenerator[str, None]:
-        """Stream guardrailed chunks to client while redacting PII in real time.
+    Handles stream lifecycle safely:
+    - Downstream client disconnection (asyncio.CancelledError): propagates cancellation without invalid yields.
+    - Upstream connection interruption mid-stream: catches transport failure, flushes lookahead buffer
+      through PII redactor to ensure partial tokens are sanitized, and terminates without leaking socket info.
+    - Normal EOF: flushes lookahead buffer and emits [DONE].
+    """
+    redactor = StreamingPIIRedactor(lookahead_window=lookahead_window)
+    chunk_index = 0
+    upstream_interrupted = False
 
-        Guarantees lossless buffer flush even if upstream terminates without [DONE].
-        """
-        redactor = StreamingPIIRedactor(lookahead_window=lookahead_window)
-        chunk_index = 0
+    try:
+        async for line in upstream_response.aiter_lines():
+            line_str = line.strip()
+            if not line_str:
+                continue
 
-        try:
-            async for line in upstream_response.aiter_lines():
-                line_str = line.strip()
-                if not line_str:
+            if line_str == "data: [DONE]":
+                break
+
+            if line_str.startswith("data: "):
+                raw_json = line_str[6:]
+                try:
+                    payload = json.loads(raw_json)
+                except json.JSONDecodeError:
                     continue
 
-                if line_str == "data: [DONE]":
-                    break
+                delta_content = ""
+                choices = payload.get("choices", [])
+                if choices and "delta" in choices[0]:
+                    delta_content = choices[0]["delta"].get("content", "")
 
-                if line_str.startswith("data: "):
-                    raw_json = line_str[6:]
-                    try:
-                        payload = json.loads(raw_json)
-                    except json.JSONDecodeError:
-                        continue
+                if delta_content:
+                    safe_text = redactor.process_chunk(delta_content)
+                    if safe_text:
+                        chunk_index += 1
+                        out_chunk = {
+                            "id": f"gw-chunk-{chunk_index}",
+                            "object": "chat.completion.chunk",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": safe_text},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(out_chunk)}\n\n"
+    except asyncio.CancelledError:
+        # Client disconnected / stream cancelled; cleanly propagate without yielding
+        raise
+    except Exception as exc:
+        # Upstream connection failed or dropped mid-stream; log sanitized event without dumping raw bodies
+        logger.warning("Upstream stream interrupted prematurely (%s)", exc.__class__.__name__)
+        upstream_interrupted = True
 
-                    delta_content = ""
-                    choices = payload.get("choices", [])
-                    if choices and "delta" in choices[0]:
-                        delta_content = choices[0]["delta"].get("content", "")
+    # Lossless drain: Guarantee remaining buffer up to point of interruption is redacted and flushed
+    final_tail = redactor.flush()
+    if final_tail:
+        chunk_index += 1
+        flush_chunk = {
+            "id": f"gw-chunk-{chunk_index}",
+            "object": "chat.completion.chunk",
+            "choices": [
+                {"index": 0, "delta": {"content": final_tail}, "finish_reason": None}
+            ],
+        }
+        yield f"data: {json.dumps(flush_chunk)}\n\n"
 
-                    if delta_content:
-                        safe_text = redactor.process_chunk(delta_content)
-                        if safe_text:
-                            chunk_index += 1
-                            out_chunk = {
-                                "id": f"gw-chunk-{chunk_index}",
-                                "object": "chat.completion.chunk",
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": safe_text},
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                            yield f"data: {json.dumps(out_chunk)}\n\n"
-        except asyncio.CancelledError:
-            # Client disconnected / stream cancelled; cleanly propagate without yielding
-            raise
-        except Exception as exc:
-            # Upstream connection failed or dropped mid-stream; log diagnostics to server logs
-            logger.error("Upstream connection dropped during streaming: %s", exc)
-            return
-
-        # Lossless drain on normal stream completion / EOF: Guarantee remaining buffer is flushed and redacted
-        final_tail = redactor.flush()
-        if final_tail:
-            chunk_index += 1
-            flush_chunk = {
-                "id": f"gw-chunk-{chunk_index}",
-                "object": "chat.completion.chunk",
-                "choices": [
-                    {"index": 0, "delta": {"content": final_tail}, "finish_reason": None}
-                ],
-            }
-            yield f"data: {json.dumps(flush_chunk)}\n\n"
-
+    if not upstream_interrupted:
         yield "data: [DONE]\n\n"
+
+
+def create_proxy_app(upstream_url: str = "http://127.0.0.1:8002/v1/chat/completions") -> FastAPI:
+    app = FastAPI(title="LLMGatewayStreamingGuardrail")
 
     @app.post("/v1/chat/completions")
     async def chat_completions_proxy(request: Request):
@@ -111,11 +118,10 @@ def create_proxy_app(upstream_url: str = "http://127.0.0.1:8002/v1/chat/completi
             if resp.status_code >= 400:
                 await resp.aread()
                 status_code = resp.status_code
-                error_body = resp.text
                 await resp.aclose()
                 await client.aclose()
-                # Log detailed upstream diagnostics strictly to server logs
-                logger.error("Upstream model provider error (%d): %s", status_code, error_body)
+                # Log only sanitized status code without dumping raw body to protect customer PII and internal data
+                logger.error("Upstream model provider returned error HTTP %d", status_code)
                 # Return generic client-facing message to prevent information disclosure
                 return JSONResponse(
                     status_code=status_code,
@@ -126,7 +132,8 @@ def create_proxy_app(upstream_url: str = "http://127.0.0.1:8002/v1/chat/completi
                         }
                     },
                 )
-        except Exception:
+        except Exception as exc:
+            logger.error("Upstream connection failure (%s)", exc.__class__.__name__)
             await client.aclose()
             return JSONResponse(
                 status_code=502,
