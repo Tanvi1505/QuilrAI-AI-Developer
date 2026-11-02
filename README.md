@@ -187,12 +187,13 @@ flowchart LR
 
 ### Engineering Decisions
 * **Authorization before execution:** For `tools/call`, the gateway inspects `params.name`. Tools beginning with `admin_` require the `admin` role. Unauthorized calls are rejected with JSON-RPC error `-32001` before reaching the downstream server.
+* **Strict wire parameter validation:** The gateway validates that the JSON-RPC request is a JSON object and that `params` and `name` adhere to required data types. Malformed parameter envelopes are rejected with JSON-RPC error `-32602` or `-32600` before authorization.
 * **Downstream isolation:** A rejected administrative request should not cause side effects in the underlying MCP service. The tests include verification that unauthorized calls do not generate downstream requests.
 * **Protocol-preserving behavior:** Permitted requests, including tool discovery through `tools/list`, are forwarded to the backend. Error responses preserve the JSON-RPC request identifier so clients can correlate requests and responses.
-* **Authentication support:** The implementation supports HS256 JWT validation and pre-shared service keys for controlled development and testing scenarios.
+* **Authentication and secret isolation:** The implementation reads `JWT_SECRET` from environment variables, supporting dependency injection for automated test harnesses. When running in production mode (`ENVIRONMENT=production`), the gateway enforces explicit `JWT_SECRET` provisioning and disables demonstration pre-shared test credentials.
 
 ### Production Considerations
-In a deployed environment, credentials would be managed through a secret-management system, with key rotation, short-lived tokens, structured audit logging, and appropriate transport security.
+In a deployed environment, credentials would be managed through a secret-management system (such as GCP Secret Manager or HashiCorp Vault), with key rotation, short-lived tokens, structured audit logging, and appropriate transport security.
 
 **Architecture Decision Record:** [ADR-002: MCP Security Gateway Proxy](./task2_security_gateway/ADR-002-MCP-Security-Gateway-Proxy.md)
 
@@ -221,8 +222,8 @@ Detected values are replaced with:
 ### Engineering Decisions
 * **Cross-chunk detection:** The redactor retains text that may form part of a sensitive value across multiple upstream chunks.
 * **Internal whitespace handling:** SSNs and payment-card numbers may contain spaces or hyphens. The redactor evaluates these patterns across the active buffer rather than treating every space as a safe output boundary.
-* **Bounded buffering:** The implementation uses a configurable lookahead window and an oversized-token threshold to limit memory growth. Oversized uninterrupted tokens are handled conservatively through redaction rather than releasing their contents as raw text.
-* **Streaming termination:** Remaining buffered content is processed when the upstream stream terminates, including ordinary end-of-stream conditions without a final `[DONE]` marker.
+* **Bounded buffering & stateful token discard:** The implementation uses a configurable lookahead window and an oversized-token threshold to limit memory growth. Trailing tokens exceeding `max_unbroken_token_len` are replaced with `[REDACTED]`, and subsequent chunks belonging to the same oversized token are statefully swallowed until the next delimiter.
+* **Streaming termination & failure sanitization:** Remaining buffered content is flushed when the upstream stream terminates cleanly. If the upstream provider fails or returns HTTP errors, raw server bodies and internal network topologies are kept in server logs while returning a generic `UPSTREAM_ERROR` to the client.
 
 ### Security and Performance Trade-offs
 Streaming redaction introduces a fundamental trade-off between latency, memory use, and the amount of context retained for detecting sensitive values.
@@ -259,6 +260,7 @@ flowchart TD
 ```
 
 ### Engineering Decisions
+* **Strict request shape validation:** The gateway explicitly validates that incoming payloads are JSON objects, checking that `prompt` is present, non-empty, and a string. JSON arrays, null values, numeric prompts, and missing fields return HTTP 400 before rate-limiting or routing.
 * **Tenant identity from verified credentials:** The gateway resolves tenant identity from registered Bearer credentials rather than trusting arbitrary tenant identifiers supplied by callers. Unauthorized requests receive HTTP 401.
 * **Server-side quota reservation:** The gateway estimates prompt usage and reserves capacity for the permitted maximum output. This prevents a caller from supplying an artificially small `requested_tokens` value to bypass quota accounting. Invalid token-count parameters are rejected before quota allocation.
 * **Atomic sliding-window rate limiting:** Quota events are stored in SQLite using a rolling 60-second window. WAL journaling and `BEGIN IMMEDIATE` transactions coordinate quota checks and writes for concurrent workers sharing the same SQLite database.

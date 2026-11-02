@@ -415,3 +415,53 @@ async def test_proxy_endpoint_authenticates_tenant_and_clamps_token_floor(temp_d
         usage = await limiter.get_current_usage("tenant_1")
         assert usage >= 356, f"Expected usage to account for permitted maximum output (>= 356), got {usage}"
 
+
+@pytest.mark.asyncio
+async def test_proxy_endpoint_rejects_malformed_request_shapes(temp_db):
+    """Verify endpoint rejects JSON arrays, null, numeric prompts, and missing prompt fields with HTTP 400."""
+    app = create_gateway_app(db_path=temp_db)
+    transport = ASGITransport(app=app)
+    auth_header = {"Authorization": "Bearer live_key_tenant_alpha_921"}
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Case 1: JSON array payload
+        res_arr = await client.post("/v1/completions", json=[{"prompt": "hello"}], headers=auth_header)
+        assert res_arr.status_code == 400
+        assert res_arr.json()["error"]["code"] == "INVALID_REQUEST_SHAPE"
+
+        # Case 2: JSON null / primitive payload
+        res_null = await client.post(
+            "/v1/completions",
+            content=b"null",
+            headers={**auth_header, "content-type": "application/json"},
+        )
+        assert res_null.status_code == 400
+        assert res_null.json()["error"]["code"] == "INVALID_REQUEST_SHAPE"
+
+        # Case 3: Missing 'prompt' field
+        res_missing = await client.post(
+            "/v1/completions",
+            json={"max_tokens": 128},
+            headers=auth_header,
+        )
+        assert res_missing.status_code == 400
+        assert res_missing.json()["error"]["code"] == "MISSING_REQUIRED_FIELD"
+
+        # Case 4: Numeric 'prompt'
+        res_num = await client.post(
+            "/v1/completions",
+            json={"prompt": 98765},
+            headers=auth_header,
+        )
+        assert res_num.status_code == 400
+        assert res_num.json()["error"]["code"] == "INVALID_PROMPT"
+
+        # Case 5: Whitespace-only 'prompt'
+        res_blank = await client.post(
+            "/v1/completions",
+            json={"prompt": "    \t\n  "},
+            headers=auth_header,
+        )
+        assert res_blank.status_code == 400
+        assert res_blank.json()["error"]["code"] == "INVALID_PROMPT"
+

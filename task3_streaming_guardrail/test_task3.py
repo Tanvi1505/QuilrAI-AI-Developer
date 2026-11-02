@@ -354,3 +354,38 @@ async def test_streaming_proxy_malformed_json_returns_400():
         data = resp.json()
         assert data["error"]["code"] == "INVALID_JSON"
 
+
+@pytest.mark.asyncio
+async def test_streaming_proxy_upstream_error_sanitization():
+    """Verify upstream HTTP errors are sanitized to generic client messages without leaking internal topology."""
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    error_mock_app = FastAPI()
+
+    @error_mock_app.post("/v1/chat/completions")
+    async def failing_endpoint():
+        return JSONResponse(
+            status_code=500,
+            content={"internal_diagnostics": "ConnectionRefused at db-node-7.prod.internal.local:5432"},
+        )
+
+    err_transport = ASGITransport(app=error_mock_app)
+    proxy_app = create_proxy_app(upstream_url="http://error-upstream/v1/chat/completions")
+
+    from unittest.mock import patch
+    original_client = httpx.AsyncClient
+
+    def get_test_client(*args, **kwargs):
+        return original_client(transport=err_transport, *args, **kwargs)
+
+    with patch("task3_streaming_guardrail.proxy_server.httpx.AsyncClient", side_effect=get_test_client):
+        proxy_transport = ASGITransport(app=proxy_app)
+        async with AsyncClient(transport=proxy_transport, base_url="http://test-gw") as client:
+            resp = await client.post("/v1/chat/completions", json={"prompt": "test"})
+            assert resp.status_code == 500
+            data = resp.json()
+            assert data["error"]["code"] == "UPSTREAM_ERROR"
+            assert data["error"]["message"] == "Upstream model provider returned an error"
+            assert "db-node-7.prod.internal.local" not in resp.text
+

@@ -250,3 +250,47 @@ async def test_tools_call_malformed_params_returns_code_32602(test_setup):
         )
         assert res3.status_code == 400
         assert res3.json()["error"]["code"] == -32602
+
+
+@pytest.mark.asyncio
+async def test_custom_jwt_secret_dependency_injection():
+    """Verify gateway accepts injected custom JWT secret and rejects tokens signed with different secret."""
+    custom_secret = "custom-production-signing-key-456!"
+    app = create_gateway_app(jwt_secret=custom_secret, allow_test_credentials=False)
+    transport = ASGITransport(app=app)
+
+    valid_token = create_token(role="admin", secret=custom_secret)
+    invalid_token = create_token(role="admin", secret="wrong-secret-key-999-padding-32chars!")
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Invalid secret signature fails authentication
+        res1 = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            headers={"Authorization": f"Bearer {invalid_token}"},
+        )
+        assert res1.status_code == 401
+        assert res1.json()["error"]["code"] == -32000
+
+        # Pre-shared test credential disabled
+        res2 = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            headers={"Authorization": "Bearer token-admin-secret-xyz"},
+        )
+        assert res2.status_code == 401
+        assert res2.json()["error"]["code"] == -32000
+
+
+@pytest.mark.asyncio
+async def test_jsonrpc_array_or_primitive_payload_rejected(test_setup):
+    """Verify non-object JSON payloads (lists, primitives) return JSON-RPC -32600."""
+    transport = test_setup
+    token = create_token(role="viewer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Payload is a list
+        res = await client.post("/mcp", json=[{"jsonrpc": "2.0"}], headers=headers)
+        assert res.status_code == 400
+        assert res.json()["error"]["code"] == -32600

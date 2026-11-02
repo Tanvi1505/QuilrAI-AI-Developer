@@ -1,5 +1,6 @@
 """Task 2: MCP Security Gateway Proxy with Bearer Auth & Tool-Level RBAC Filtering."""
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
@@ -16,34 +17,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mcp_gateway")
 
-JWT_SECRET = "security-gateway-secret-key-32chars!"
+DEFAULT_DEV_JWT_SECRET = "security-gateway-secret-key-32chars!"
 JWT_ALGORITHM = "HS256"
 
-# Known token lookup for fast testing and pre-shared token authentication
-PRESHARED_TOKENS = {
+# Test-only demonstration bearer credentials (explicitly disabled in production mode)
+TEST_PRESHARED_TOKENS: Dict[str, Dict[str, str]] = {
     "token-admin-secret-xyz": {"sub": "alice_admin", "role": "admin"},
     "token-viewer-secret-abc": {"sub": "bob_viewer", "role": "viewer"},
 }
 
 
-def create_token(role: str, user_id: str = "user-123") -> str:
+def get_jwt_secret() -> str:
+    """Retrieve JWT secret from environment configuration or development fallback."""
+    env_secret = os.getenv("JWT_SECRET")
+    if env_secret:
+        return env_secret
+    if os.getenv("ENVIRONMENT", "development").lower() == "production":
+        raise RuntimeError("JWT_SECRET environment variable is required in production mode.")
+    return DEFAULT_DEV_JWT_SECRET
+
+
+def create_token(role: str, user_id: str = "user-123", secret: Optional[str] = None) -> str:
     """Utility to generate a signed JWT with role claim."""
+    signing_secret = secret or get_jwt_secret()
     return jwt.encode(
         {"sub": user_id, "role": role},
-        JWT_SECRET,
+        signing_secret,
         algorithm=JWT_ALGORITHM,
     )
 
 
-def extract_role_from_token(token: str) -> Optional[str]:
+def extract_role_from_token(
+    token: str,
+    secret: Optional[str] = None,
+    preshared_tokens: Optional[Dict[str, Dict[str, str]]] = None,
+) -> Optional[str]:
     """Extract user role from Bearer token supporting both signed JWT and pre-shared tokens."""
+    tokens_registry = preshared_tokens if preshared_tokens is not None else TEST_PRESHARED_TOKENS
     # 1. Check pre-shared tokens
-    if token in PRESHARED_TOKENS:
-        return PRESHARED_TOKENS[token]["role"]
+    if token in tokens_registry:
+        return tokens_registry[token]["role"]
 
     # 2. Decode JWT
+    signing_secret = secret or get_jwt_secret()
     try:
-        decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        decoded = jwt.decode(token, signing_secret, algorithms=[JWT_ALGORITHM])
         return decoded.get("role")
     except jwt.PyJWTError as e:
         logger.warning("Token decoding failed: %s", e)
@@ -62,9 +80,25 @@ def make_jsonrpc_error(req_id: Any, code: int, message: str, data: Any = None) -
     }
 
 
-def create_gateway_app(downstream_url: str = "http://127.0.0.1:8001/mcp") -> FastAPI:
+def create_gateway_app(
+    downstream_url: str = "http://127.0.0.1:8001/mcp",
+    jwt_secret: Optional[str] = None,
+    preshared_tokens: Optional[Dict[str, Dict[str, str]]] = None,
+    allow_test_credentials: Optional[bool] = None,
+) -> FastAPI:
     """Factory creating the MCP Security Gateway FastAPI application."""
     http_client = httpx.AsyncClient(timeout=10.0)
+
+    # Determine credentials registry and secret with environment isolation
+    is_production = os.getenv("ENVIRONMENT", "development").lower() == "production"
+    resolved_secret = jwt_secret or get_jwt_secret()
+
+    if allow_test_credentials is None:
+        allow_demo = not is_production and os.getenv("ALLOW_TEST_CREDENTIALS", "true").lower() == "true"
+    else:
+        allow_demo = allow_test_credentials
+
+    active_preshared = preshared_tokens if preshared_tokens is not None else (TEST_PRESHARED_TOKENS if allow_demo else {})
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -91,7 +125,11 @@ def create_gateway_app(downstream_url: str = "http://127.0.0.1:8001/mcp") -> Fas
             )
 
         token = authorization.split("Bearer ", 1)[1].strip()
-        user_role = extract_role_from_token(token)
+        user_role = extract_role_from_token(
+            token,
+            secret=resolved_secret,
+            preshared_tokens=active_preshared,
+        )
 
         if not user_role:
             logger.warning("Request rejected: Invalid or expired token")
@@ -106,12 +144,19 @@ def create_gateway_app(downstream_url: str = "http://127.0.0.1:8001/mcp") -> Fas
 
         # 2. Parse JSON-RPC wire format payload
         try:
-            payload: Dict[str, Any] = await request.json()
+            payload: Any = await request.json()
         except Exception as e:
             logger.warning("Invalid JSON payload received: %s", e)
             return JSONResponse(
                 status_code=400,
                 content=make_jsonrpc_error(None, -32700, "Parse error: Invalid JSON received"),
+            )
+
+        if not isinstance(payload, dict):
+            logger.warning("Invalid JSON-RPC payload: Expected JSON object")
+            return JSONResponse(
+                status_code=400,
+                content=make_jsonrpc_error(None, -32600, "Invalid Request: Request body must be a JSON object"),
             )
 
         method = payload.get("method")

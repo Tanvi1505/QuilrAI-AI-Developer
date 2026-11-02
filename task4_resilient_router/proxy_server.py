@@ -105,8 +105,48 @@ def create_gateway_app(
                 },
             )
 
-        # 2. Server-Side Token Estimation & Quota Reservation
-        prompt_text = payload.get("prompt", "")
+        # 2. Complete Request Shape Validation (reject JSON arrays, null, non-objects)
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "error": {
+                        "code": "INVALID_REQUEST_SHAPE",
+                        "message": "Request body must be a JSON object",
+                        "status": 400,
+                        "request_id": req_id,
+                    }
+                },
+            )
+
+        if "prompt" not in payload:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "error": {
+                        "code": "MISSING_REQUIRED_FIELD",
+                        "message": "Missing required field: 'prompt'",
+                        "status": 400,
+                        "request_id": req_id,
+                    }
+                },
+            )
+
+        prompt_text = payload["prompt"]
+        if not isinstance(prompt_text, str) or not prompt_text.strip():
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "error": {
+                        "code": "INVALID_PROMPT",
+                        "message": "'prompt' must be a non-empty string",
+                        "status": 400,
+                        "request_id": req_id,
+                    }
+                },
+            )
+
+        # 3. Server-Side Token Estimation & Quota Reservation
         max_tokens = payload.get("max_tokens", 256)
         if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
             return JSONResponse(

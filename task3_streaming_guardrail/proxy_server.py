@@ -110,9 +110,17 @@ def create_proxy_app(upstream_url: str = "http://127.0.0.1:8002/v1/chat/completi
                 error_body = resp.text
                 await resp.aclose()
                 await client.aclose()
+                # Log detailed upstream diagnostics strictly to server logs
+                logger.error("Upstream model provider error (%d): %s", status_code, error_body)
+                # Return generic client-facing message to prevent information disclosure
                 return JSONResponse(
                     status_code=status_code,
-                    content={"error": {"code": "UPSTREAM_ERROR", "message": error_body}},
+                    content={
+                        "error": {
+                            "code": "UPSTREAM_ERROR",
+                            "message": "Upstream model provider returned an error",
+                        }
+                    },
                 )
         except Exception:
             await client.aclose()
