@@ -101,19 +101,27 @@ class StreamingPIIRedactor:
         self.buffer = SSN_REGEX.sub(REDACTION_TOKEN, self.buffer)
         self.buffer = CREDIT_CARD_REGEX.sub(REDACTION_TOKEN, self.buffer)
 
-        # 2. Check whitespace boundary for email redaction and token emission
+        # 2. Check whitespace boundary and guard against oversized active trailing tokens
         last_space = max(
             self.buffer.rfind(" "),
             self.buffer.rfind("\n"),
             self.buffer.rfind("\t"),
         )
+        trailing_token_len = len(self.buffer) if last_space == -1 else len(self.buffer) - (last_space + 1)
 
-        if last_space == -1:
-            if len(self.buffer) >= self.max_unbroken_token_len:
-                # Oversized uninterrupted token: to prevent leaking sensitive substrings
-                # while preserving bounded O(1) memory, replace oversized token with REDACTION_TOKEN
+        # Apply bounded memory defense to active trailing token, even if preceded by ordinary text
+        if trailing_token_len >= self.max_unbroken_token_len:
+            if last_space == -1:
+                # Buffer contains solely an oversized unbroken token
                 self.buffer = ""
                 return REDACTION_TOKEN
+            else:
+                # Buffer starts with ordinary text followed by an oversized unbroken token
+                prefix = self.buffer[: last_space + 1]
+                self.buffer = prefix + REDACTION_TOKEN + " "
+                last_space = len(self.buffer) - 1
+
+        if last_space == -1:
             return ""
 
         # 3. Redact emails strictly on closed tokens preceding the active trailing word

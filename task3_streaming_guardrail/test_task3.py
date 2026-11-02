@@ -254,6 +254,19 @@ def test_adversarial_unusually_long_unbroken_token_replaced():
     assert len(redactor.buffer) == 0
 
 
+def test_adversarial_oversized_unbroken_token_following_ordinary_text():
+    """Verify that an oversized token following whitespace does not bypass the bounded-memory limit."""
+    redactor = StreamingPIIRedactor(lookahead_window=32, max_unbroken_token_len=100)
+    # Stream ordinary text followed by a 300-char uninterrupted token
+    out1 = redactor.process_chunk("System diagnostics log: " + "X" * 300)
+    # Buffer must not hold 300 raw chars; it must cap and replace the trailing token
+    assert len(redactor.buffer) < 100
+    out2 = redactor.flush()
+    full = out1 + out2
+    assert "System diagnostics log: [REDACTED]" in full
+    assert "X" * 100 not in full
+
+
 def test_cross_chunk_boundary_spaced_ssn_redaction():
     """Verify SSNs split across whitespace chunk boundaries are completely redacted."""
     redactor = StreamingPIIRedactor(lookahead_window=32)

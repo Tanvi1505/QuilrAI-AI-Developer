@@ -20,7 +20,7 @@ Implements a runnable MCP server using the official Python SDK (`mcp.server.mcps
 * **Error Mapping (`-32602`):** I wanted a clear distinction between protocol validation errors and business logic:
   * Malformed formats (e.g. `INVALID`, negative amounts, short reasons) fail Pydantic validation and are mapped directly to standard JSON-RPC `-32602 (INVALID_PARAMS)` error codes.
   * Valid inputs for customers not in the database return an application response (`status: NOT_FOUND`) so the agent can understand what happened instead of blowing up the connection.
-* **Idempotency, Atomic Concurrency & Crash Recovery:** Added durable idempotency on refunds backed by an on-disk SQLite ledger (`WAL` mode). To prevent race conditions from simultaneous requests sharing an idempotency key, the ledger uses `BEGIN IMMEDIATE` atomic reservation (`IN_PROGRESS` vs `SETTLED`). Exactly one concurrent request executes while others receive in-progress notices or settled replays without duplicate charges. If a worker process is interrupted or crashes mid-flight, a 60-second reservation TTL automatically reclaims stale locks so retries are never permanently blocked.
+* **Idempotency, Atomic Concurrency & Crash Recovery:** Added durable idempotency on refunds backed by an on-disk SQLite ledger (`WAL` mode). To prevent race conditions from simultaneous requests sharing an idempotency key, the ledger uses `BEGIN IMMEDIATE` atomic reservation (`IN_PROGRESS` vs `SETTLED`). Exactly one concurrent request executes while others receive in-progress notices or settled replays without duplicate charges. To recover from abandoned executions if a worker crashes mid-flight, a 60-second reservation TTL acts as an automated crash-recovery safety net to reclaim stale locks (rather than an absolute distributed exactly-once guarantee, which in production would be paired with worker heartbeats or downstream gateway settlement checks if an operation ever exceeded 60s).
 
 ---
 
@@ -60,7 +60,7 @@ An LLM Gateway endpoint that streams Server-Sent Events (SSE) back to the client
   * Delimiter-aware email emission: trailing active tokens without whitespace/punctuation are held in the buffer until a delimiter confirms the token is closed, completely preventing emails or subdomains from being partially matched or sliced.
   * Supported formats: expanded regex handles standard RFC 5321 emails (up to 254 chars), US SSNs, and multiple payment card PAN formats (Visa 13/16, MasterCard, Amex 15-digit / 4-6-5, Diners Club 14-digit / 4-6-4, Discover).
   * Lossless flush: when the stream terminates (or if upstream SSE drops without `[DONE]`), the `finally` block redacts and flushes any remaining buffer text so no tokens are lost.
-* **Oversized Token Defense & Bounded Memory:** To maintain $O(1)$ memory and protect against delimiter-free streams (e.g. continuous base64 payloads), unbroken tokens exceeding `max_unbroken_token_len` (512 chars) are replaced with `[REDACTED]` rather than emitted as raw slices, guaranteeing zero sensitive text leakage.
+* **Oversized Token Defense & Complete Bounded Memory:** To guarantee strict $O(1)$ memory bounds even on malicious streams, the length check is applied directly to the active trailing token (whether or not the buffer starts with ordinary text or whitespace). Any trailing uninterrupted token reaching `max_unbroken_token_len` (512 chars) is replaced with `[REDACTED]` rather than emitted as raw slices, preventing both memory bloat and sensitive fragment leakage.
 
 ---
 

@@ -128,11 +128,15 @@ def reserve_or_get_idempotency(
     - ('IN_PROGRESS', None): A concurrent worker is currently processing this key within TTL.
     - ('RESERVED', None): This caller won the reservation lock (or reclaimed a stale lock) and must proceed.
 
-    Reservation Recovery Architecture:
+    Reservation Recovery Architecture & Operational Boundary:
     If a server worker crashes or network breaks mid-transaction, an idempotency key could be left
-    permanently stuck as IN_PROGRESS. We enforce a 60s TTL on IN_PROGRESS reservations. If a subsequent
-    request arrives after the TTL has expired without settling, the reservation is safely reclaimed,
-    allowing recovery from worker failures without risking simultaneous duplicate executions.
+    permanently stuck as IN_PROGRESS. We enforce a 60s TTL on IN_PROGRESS reservations as an automated
+    recovery mechanism to unblock subsequent retries after worker failures.
+    Caveat: This TTL serves as a crash-recovery safety net rather than an absolute mathematical exactly-once
+    guarantee. If an external transaction exceptionally exceeds 60 seconds of processing time, a subsequent
+    retry could reclaim the reservation while the original call is still running. In high-latency distributed
+    production environments, this is paired with periodic reservation heartbeating or downstream payment
+    gateway settlement deduplication.
     """
     _init_idempotency_store(db_path)
     conn = sqlite3.connect(db_path, timeout=10.0, isolation_level=None)
