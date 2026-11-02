@@ -72,6 +72,10 @@ def create_proxy_app(upstream_url: str = "http://127.0.0.1:8002/v1/chat/completi
         except asyncio.CancelledError:
             # Client disconnected / stream cancelled; cleanly propagate without yielding
             raise
+        except Exception as exc:
+            # Upstream connection failed or dropped mid-stream; log diagnostics to server logs
+            logger.error("Upstream connection dropped during streaming: %s", exc)
+            return
 
         # Lossless drain on normal stream completion / EOF: Guarantee remaining buffer is flushed and redacted
         final_tail = redactor.flush()

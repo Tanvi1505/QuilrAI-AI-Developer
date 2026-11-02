@@ -40,6 +40,34 @@ class ResilientModelRouter:
     ) -> Tuple[int, Dict[str, Any]]:
         """Routes completion to Primary. On 429 or timeout (>3000ms), fails over to Secondary."""
         req_id = request_id or f"req-{uuid.uuid4().hex[:12]}"
+
+        # Validate request payload shape
+        if not isinstance(payload, dict):
+            return 400, {
+                "error": {
+                    "code": "INVALID_REQUEST_SHAPE",
+                    "message": "Request payload must be a JSON object",
+                    "request_id": req_id,
+                }
+            }
+        if "prompt" not in payload:
+            return 400, {
+                "error": {
+                    "code": "MISSING_REQUIRED_FIELD",
+                    "message": "Missing required field: 'prompt'",
+                    "request_id": req_id,
+                }
+            }
+        prompt_text = payload.get("prompt")
+        if not isinstance(prompt_text, str) or not prompt_text.strip():
+            return 400, {
+                "error": {
+                    "code": "INVALID_PROMPT",
+                    "message": "'prompt' must be a non-empty string",
+                    "request_id": req_id,
+                }
+            }
+
         should_failover = False
         failover_reason = ""
 

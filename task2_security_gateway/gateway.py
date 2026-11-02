@@ -17,29 +17,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mcp_gateway")
 
-DEFAULT_DEV_JWT_SECRET = "security-gateway-secret-key-32chars!"
 JWT_ALGORITHM = "HS256"
 
-# Test-only demonstration bearer credentials (explicitly disabled in production mode)
-TEST_PRESHARED_TOKENS: Dict[str, Dict[str, str]] = {
-    "token-admin-secret-xyz": {"sub": "alice_admin", "role": "admin"},
-    "token-viewer-secret-abc": {"sub": "bob_viewer", "role": "viewer"},
-}
 
+def get_jwt_secret(secret: Optional[str] = None) -> str:
+    """Retrieve JWT secret from parameter or environment configuration.
 
-def get_jwt_secret() -> str:
-    """Retrieve JWT secret from environment configuration or development fallback."""
+    In production and deployment environments, JWT_SECRET must be supplied via the
+    environment or secrets manager (e.g. GCP Secret Manager, Vault).
+    """
+    if secret:
+        return secret
     env_secret = os.getenv("JWT_SECRET")
     if env_secret:
         return env_secret
-    if os.getenv("ENVIRONMENT", "development").lower() == "production":
-        raise RuntimeError("JWT_SECRET environment variable is required in production mode.")
-    return DEFAULT_DEV_JWT_SECRET
+    raise ValueError(
+        "JWT_SECRET environment variable is not configured. "
+        "Set JWT_SECRET in your environment or inject jwt_secret into create_gateway_app()."
+    )
 
 
 def create_token(role: str, user_id: str = "user-123", secret: Optional[str] = None) -> str:
     """Utility to generate a signed JWT with role claim."""
-    signing_secret = secret or get_jwt_secret()
+    signing_secret = get_jwt_secret(secret)
     return jwt.encode(
         {"sub": user_id, "role": role},
         signing_secret,
@@ -53,13 +53,18 @@ def extract_role_from_token(
     preshared_tokens: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Optional[str]:
     """Extract user role from Bearer token supporting both signed JWT and pre-shared tokens."""
-    tokens_registry = preshared_tokens if preshared_tokens is not None else TEST_PRESHARED_TOKENS
-    # 1. Check pre-shared tokens
+    tokens_registry = preshared_tokens or {}
+    # 1. Check pre-shared tokens registry
     if token in tokens_registry:
         return tokens_registry[token]["role"]
 
     # 2. Decode JWT
-    signing_secret = secret or get_jwt_secret()
+    try:
+        signing_secret = get_jwt_secret(secret)
+    except ValueError as e:
+        logger.error("Authentication check failed: %s", e)
+        return None
+
     try:
         decoded = jwt.decode(token, signing_secret, algorithms=[JWT_ALGORITHM])
         return decoded.get("role")
@@ -84,21 +89,11 @@ def create_gateway_app(
     downstream_url: str = "http://127.0.0.1:8001/mcp",
     jwt_secret: Optional[str] = None,
     preshared_tokens: Optional[Dict[str, Dict[str, str]]] = None,
-    allow_test_credentials: Optional[bool] = None,
 ) -> FastAPI:
     """Factory creating the MCP Security Gateway FastAPI application."""
     http_client = httpx.AsyncClient(timeout=10.0)
-
-    # Determine credentials registry and secret with environment isolation
-    is_production = os.getenv("ENVIRONMENT", "development").lower() == "production"
-    resolved_secret = jwt_secret or get_jwt_secret()
-
-    if allow_test_credentials is None:
-        allow_demo = not is_production and os.getenv("ALLOW_TEST_CREDENTIALS", "true").lower() == "true"
-    else:
-        allow_demo = allow_test_credentials
-
-    active_preshared = preshared_tokens if preshared_tokens is not None else (TEST_PRESHARED_TOKENS if allow_demo else {})
+    resolved_secret = jwt_secret or os.getenv("JWT_SECRET")
+    active_preshared = preshared_tokens or {}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

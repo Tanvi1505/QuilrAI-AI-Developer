@@ -1,9 +1,18 @@
 """Comprehensive test suite for Task 2: MCP Security Gateway Proxy."""
+import os
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from task2_security_gateway.gateway import create_gateway_app, create_token
+from task2_security_gateway.gateway import create_gateway_app, create_token, get_jwt_secret
 from task2_security_gateway.mock_mcp_backend import app as backend_app, call_history
+
+TEST_JWT_SECRET = "test-security-gateway-secret-key-32chars!"
+TEST_PRESHARED_TOKENS = {
+    "token-admin-secret-xyz": {"sub": "alice_admin", "role": "admin"},
+    "token-viewer-secret-abc": {"sub": "bob_viewer", "role": "viewer"},
+}
+
+os.environ["JWT_SECRET"] = TEST_JWT_SECRET
 
 
 @pytest.fixture(autouse=True)
@@ -13,7 +22,7 @@ def clear_backend_call_history():
 
 @pytest.fixture
 def test_setup():
-    # Setup test gateway connected to in-memory downstream backend
+    # Setup test gateway connected to in-memory downstream backend with explicit test credentials
     backend_transport = ASGITransport(app=backend_app)
 
     async def mock_forward_to_downstream(payload, url, client):
@@ -22,7 +31,11 @@ def test_setup():
             from fastapi import Response
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
 
-    gateway_app = create_gateway_app(downstream_url="http://mock-downstream/mcp")
+    gateway_app = create_gateway_app(
+        downstream_url="http://mock-downstream/mcp",
+        jwt_secret=TEST_JWT_SECRET,
+        preshared_tokens=TEST_PRESHARED_TOKENS,
+    )
     # Patch forward function for direct in-memory fast testing
     from task2_security_gateway import gateway
     original_forward = gateway.forward_to_downstream
@@ -256,7 +269,7 @@ async def test_tools_call_malformed_params_returns_code_32602(test_setup):
 async def test_custom_jwt_secret_dependency_injection():
     """Verify gateway accepts injected custom JWT secret and rejects tokens signed with different secret."""
     custom_secret = "custom-production-signing-key-456!"
-    app = create_gateway_app(jwt_secret=custom_secret, allow_test_credentials=False)
+    app = create_gateway_app(jwt_secret=custom_secret, preshared_tokens={})
     transport = ASGITransport(app=app)
 
     valid_token = create_token(role="admin", secret=custom_secret)
@@ -294,3 +307,14 @@ async def test_jsonrpc_array_or_primitive_payload_rejected(test_setup):
         res = await client.post("/mcp", json=[{"jsonrpc": "2.0"}], headers=headers)
         assert res.status_code == 400
         assert res.json()["error"]["code"] == -32600
+
+
+def test_missing_jwt_secret_raises_configuration_error():
+    """Verify that attempting to retrieve secret without JWT_SECRET raises ValueError."""
+    old_secret = os.environ.pop("JWT_SECRET", None)
+    try:
+        with pytest.raises(ValueError, match="JWT_SECRET environment variable is not configured"):
+            get_jwt_secret()
+    finally:
+        if old_secret:
+            os.environ["JWT_SECRET"] = old_secret
